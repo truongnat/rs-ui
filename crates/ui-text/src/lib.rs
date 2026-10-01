@@ -3,10 +3,13 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use cosmic_text::{Attrs, Buffer, Family, FontSystem, Metrics, Shaping, SwashCache, Weight};
+use cosmic_text::{
+    Attrs, Buffer, Cursor, Family, FontSystem, Metrics, Shaping, SwashCache, Weight,
+};
 use swash::scale::image::Content as SwashContent;
 pub use ui_core::TextRunId;
-use ui_core::{Color, Point, Size};
+use ui_core::{Color, Point, Rect, Size};
+use unicode_segmentation::UnicodeSegmentation;
 
 const DEFAULT_ATLAS_SIZE: u32 = 1024;
 const MAX_ATLAS_SIZE: u32 = 4096;
@@ -61,6 +64,16 @@ pub struct TextMetrics {
     pub size: Size,
     pub baseline: f32,
     pub glyph_count: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct TextLineMetrics {
+    pub start: usize,
+    pub end: usize,
+    pub top: f32,
+    pub baseline: f32,
+    pub height: f32,
+    pub width: f32,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -159,6 +172,8 @@ struct ShapedRun {
     metrics: TextMetrics,
     glyphs: Vec<GlyphPosition>,
     color: Color,
+    text: String,
+    layout: Arc<Buffer>,
 }
 
 #[derive(Debug)]
@@ -318,7 +333,106 @@ impl TextSystem {
             },
             glyphs,
             color: style.color,
+            text: text.to_owned(),
+            layout: Arc::new(buffer),
         }
+    }
+
+    /// Resolve a grapheme-cluster index to logical-point coordinates from the shaped layout.
+    pub fn position_to_point(&self, id: TextRunId, position: usize) -> Option<Point> {
+        let run = self.runs.get(&id)?;
+        let cursor = cursor_for_position(&run.text, position);
+        let (x, y) = run.layout.cursor_position(&cursor)?;
+        Some(Point::new(x, y))
+    }
+
+    /// Resolve logical-point coordinates to a grapheme-cluster index.
+    pub fn point_to_position(&self, id: TextRunId, point: Point) -> Option<usize> {
+        let run = self.runs.get(&id)?;
+        let cursor = run.layout.hit(point.x, point.y)?;
+        Some(position_for_cursor(&run.text, cursor))
+    }
+
+    /// Return one rectangle per visual selection span, including bidi and multiline spans.
+    pub fn selection_rects(&self, id: TextRunId, start: usize, end: usize) -> Option<Vec<Rect>> {
+        let run = self.runs.get(&id)?;
+        let (start_pos, end_pos) = (start.min(end), start.max(end));
+        let start = cursor_for_position(&run.text, start_pos);
+        let end = cursor_for_position(&run.text, end_pos);
+        Some(
+            run.layout
+                .layout_runs()
+                .flat_map(|line| {
+                    let y = line.line_top;
+                    let height = line.line_height;
+                    line.highlight(start, end).map(move |(x, width)| {
+                        Rect::from_min_size(Point::new(x, y), Size::new(width, height))
+                    })
+                })
+                .collect(),
+        )
+    }
+
+    pub fn caret_rect(&self, id: TextRunId, position: usize, width: f32) -> Option<Rect> {
+        let run = self.runs.get(&id)?;
+        let cursor = cursor_for_position(&run.text, position);
+        let (x, _) = run.layout.cursor_position(&cursor)?;
+        let line = run
+            .layout
+            .layout_runs()
+            .find(|line| line.line_i == cursor.line && line.cursor_position(&cursor).is_some())?;
+        Some(Rect::from_min_size(
+            Point::new(x, line.line_top),
+            Size::new(width.max(0.0), line.line_height),
+        ))
+    }
+
+    pub fn line_metrics(&self, id: TextRunId) -> Option<Vec<TextLineMetrics>> {
+        let run = self.runs.get(&id)?;
+        Some(
+            run.layout
+                .layout_runs()
+                .map(|line| {
+                    let base = run
+                        .text
+                        .split('\n')
+                        .take(line.line_i)
+                        .map(|s| s.graphemes(true).count() + 1)
+                        .sum::<usize>();
+                    let start_byte = line
+                        .glyphs
+                        .iter()
+                        .map(|glyph| glyph.start)
+                        .min()
+                        .unwrap_or(0);
+                    let end_byte = line
+                        .glyphs
+                        .iter()
+                        .map(|glyph| glyph.end)
+                        .max()
+                        .unwrap_or(start_byte);
+                    let text_line = line.text;
+                    TextLineMetrics {
+                        start: base
+                            + text_line
+                                .get(..start_byte)
+                                .unwrap_or("")
+                                .graphemes(true)
+                                .count(),
+                        end: base
+                            + text_line
+                                .get(..end_byte)
+                                .unwrap_or(text_line)
+                                .graphemes(true)
+                                .count(),
+                        top: line.line_top,
+                        baseline: line.line_y,
+                        height: line.line_height,
+                        width: line.line_w,
+                    }
+                })
+                .collect(),
+        )
     }
 
     pub fn measure(&mut self, text: &str, style: TextStyle, width: Option<f32>) -> TextMetrics {
@@ -646,6 +760,39 @@ impl TextSystem {
     }
 }
 
+fn cursor_for_position(text: &str, position: usize) -> Cursor {
+    let mut remaining = position;
+    for (line, value) in text.split('\n').enumerate() {
+        let count = value.graphemes(true).count();
+        if remaining <= count {
+            let byte = value
+                .grapheme_indices(true)
+                .nth(remaining)
+                .map_or(value.len(), |(i, _)| i);
+            return Cursor::new(line, byte);
+        }
+        remaining = remaining.saturating_sub(count + 1);
+    }
+    let line = text.split('\n').count().saturating_sub(1);
+    Cursor::new(line, text.rsplit('\n').next().unwrap_or_default().len())
+}
+
+fn position_for_cursor(text: &str, cursor: Cursor) -> usize {
+    let mut position = 0;
+    for (line, value) in text.split('\n').enumerate() {
+        if line == cursor.line {
+            let byte = cursor.index.min(value.len());
+            let byte = (0..=byte)
+                .rev()
+                .find(|index| value.is_char_boundary(*index))
+                .unwrap_or(0);
+            return position + value[..byte].graphemes(true).count();
+        }
+        position += value.graphemes(true).count() + 1;
+    }
+    text.graphemes(true).count()
+}
+
 impl Default for TextSystem {
     fn default() -> Self {
         Self::new()
@@ -722,6 +869,30 @@ mod tests {
         assert!(text.run_metrics(id).unwrap().size.width > old_width);
         assert!(text.remove_run(id));
         assert_eq!(text.run_metrics(id), None);
+    }
+
+    #[test]
+    fn logical_grapheme_positions_resolve_to_geometry_and_back_across_lines() {
+        let mut text = TextSystem::new();
+        let value = "Xin chào\nTrường 🇻🇳";
+        let id = text.shape(value, TextStyle::default(), None);
+        let position = value.graphemes(true).count() - 2;
+        for position in [
+            0,
+            2,
+            5,
+            8,
+            10,
+            13,
+            value.graphemes(true).count() - 1,
+            position,
+        ] {
+            let point = text.position_to_point(id, position).unwrap();
+            assert_eq!(text.point_to_position(id, point), Some(position));
+        }
+        assert!(text.caret_rect(id, position, 1.0).unwrap().height() > 0.0);
+        assert!(!text.selection_rects(id, 0, position).unwrap().is_empty());
+        assert!(text.line_metrics(id).unwrap().len() >= 2);
     }
 
     #[test]

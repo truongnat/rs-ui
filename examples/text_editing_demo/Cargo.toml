@@ -1,0 +1,17 @@
+[package]
+name = "text_editing_demo"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+arboard.workspace = true
+pollster.workspace = true
+ui-core = { path = "../../crates/ui-core" }
+ui-renderer = { path = "../../crates/ui-renderer" }
+ui-runtime = { path = "../../crates/ui-runtime" }
+ui-text = { path = "../../crates/ui-text" }
+ui-window = { path = "../../crates/ui-window" }
+unicode-segmentation.workspace = true
+wgpu.workspace = true
+winit.workspace = true

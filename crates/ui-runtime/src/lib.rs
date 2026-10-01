@@ -12,9 +12,11 @@ use ui_text::TextMetrics;
 
 mod interaction;
 mod scroll;
+mod text_editing;
 
 pub use interaction::*;
 pub use scroll::*;
+pub use text_editing::*;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct NodeId(u64);

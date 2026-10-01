@@ -7,3 +7,8 @@ license.workspace = true
 [dependencies]
 ui-core = { path = "../ui-core" }
 ui-text = { path = "../ui-text" }
+unicode-segmentation.workspace = true
+
+[[bench]]
+name = "text_editing"
+harness = false
