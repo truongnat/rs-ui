@@ -12,3 +12,7 @@ unicode-segmentation.workspace = true
 [[bench]]
 name = "text_editing"
 harness = false
+
+[[bench]]
+name = "accessibility"
+harness = false

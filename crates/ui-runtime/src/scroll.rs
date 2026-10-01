@@ -289,6 +289,8 @@ impl UiTree {
             target.dirty.insert(DirtyFlags::PAINT);
             target.dirty.insert(DirtyFlags::HIT_TEST);
         }
+        self.invalidate_accessibility_subtree(node);
+        self.invalidate_accessibility_chain(node);
     }
 
     fn interaction_runtime_scroll_set(&mut self, node: NodeId, state: ScrollState) {

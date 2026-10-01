@@ -137,6 +137,7 @@ pub enum EventType {
     KeyUp,
     WindowFocus,
     WindowBlur,
+    AccessibilityAction,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -153,6 +154,7 @@ pub enum EventKind {
     KeyUp(KeyEvent),
     WindowFocus,
     WindowBlur,
+    AccessibilityAction(crate::AccessibilityAction),
 }
 
 impl EventKind {
@@ -170,6 +172,7 @@ impl EventKind {
             Self::KeyUp(_) => EventType::KeyUp,
             Self::WindowFocus => EventType::WindowFocus,
             Self::WindowBlur => EventType::WindowBlur,
+            Self::AccessibilityAction(_) => EventType::AccessibilityAction,
         }
     }
 }
@@ -404,6 +407,33 @@ impl InteractionRuntime {
 }
 
 impl UiTree {
+    pub(crate) fn accessibility_press(&mut self, node: NodeId) -> Result<(), RuntimeError> {
+        self.nodes
+            .get(&node)
+            .ok_or(RuntimeError::UnknownNode(node))?;
+        self.dispatch_to_target(
+            node,
+            Event::new(EventKind::Click(PointerEvent {
+                button: Some(PointerButton::Primary),
+                click_count: 1,
+                ..PointerEvent::default()
+            })),
+        );
+        Ok(())
+    }
+
+    pub(crate) fn accessibility_action_event(
+        &mut self,
+        node: NodeId,
+        action: crate::AccessibilityAction,
+    ) -> Result<(), RuntimeError> {
+        self.nodes
+            .get(&node)
+            .ok_or(RuntimeError::UnknownNode(node))?;
+        self.dispatch_to_target(node, Event::new(EventKind::AccessibilityAction(action)));
+        Ok(())
+    }
+
     pub fn set_hit_test_state(
         &mut self,
         node: NodeId,
@@ -416,6 +446,8 @@ impl UiTree {
         target.hit_test = state;
         target.hit_test_overridden = true;
         target.dirty.insert(DirtyFlags::HIT_TEST);
+        self.invalidate_accessibility_subtree(node);
+        self.invalidate_accessibility_chain(node);
         Ok(())
     }
 
@@ -733,6 +765,7 @@ impl UiTree {
             .get_mut(&node)
             .ok_or(RuntimeError::UnknownNode(node))?;
         target.scrollable = scrollable;
+        self.invalidate_accessibility_subtree(node);
         Ok(())
     }
 
@@ -936,7 +969,11 @@ impl UiTree {
             .ok_or(RuntimeError::UnknownNode(node))?;
         target.focus_policy = policy;
         target.dirty.insert(DirtyFlags::ACCESSIBILITY);
+        self.invalidate_accessibility_chain(node);
         self.rebuild_focus_order();
+        if policy.disabled && self.focus_manager().focused() == Some(node) {
+            self.clear_focus();
+        }
         Ok(())
     }
 
@@ -972,11 +1009,16 @@ impl UiTree {
     }
 
     fn set_focused_state(&mut self, node: NodeId, focused: bool) {
+        let mut changed = false;
         if let Some(target) = self.nodes.get_mut(&node)
             && target.interaction.focused != focused
         {
             target.interaction.focused = focused;
             target.dirty.insert(DirtyFlags::PAINT);
+            changed = true;
+        }
+        if changed {
+            self.invalidate_accessibility_chain(node);
         }
     }
 

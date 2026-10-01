@@ -22,7 +22,7 @@ Metal / D3D12 / Vulkan
 
 - **Desktop-first, GPU-first:** the first platform path is a native `winit` window and a `wgpu` surface.
 - **Hybrid retained/immediate:** components may retain state, but each frame is submitted as a small, explicit display list.
-- **Text and accessibility are core concerns:** they will enter the runtime/display-list interfaces, not be bolted onto the renderer later.
+- **Text and accessibility are runtime concerns:** text and semantic output stay separate from paint commands; the renderer consumes only the display list.
 - **HiDPI is explicit:** all public geometry is logical-point geometry; the renderer owns logical-to-physical conversion and clipping.
 - **No browser clone:** layout and component semantics stay above the renderer; there is no CSS box-model compatibility layer.
 - **Component isolation:** components publish drawing commands and never import `wgpu` or `winit`.
@@ -46,7 +46,7 @@ Metal / D3D12 / Vulkan
 
 ## Remaining runtime work
 
-Visual QA should cover more operating-system font sets and fractional monitor scales. Rich-text spans, color emoji, accessibility nodes, text editing, and GPU timestamp queries remain separate follow-on work. Rounded corners currently use tessellated arcs plus MSAA, not analytic coverage; line widths and HiDPI need visual calibration on multiple GPUs.
+Visual QA should cover more operating-system font sets and fractional monitor scales. Rich-text spans, color emoji, full screen-reader UX certification, and GPU timestamp queries remain separate follow-on work. Rounded corners currently use tessellated arcs plus MSAA, not analytic coverage; line widths and HiDPI need visual calibration on multiple GPUs.
 
 ## Phase 3.5 — Rendering hardening
 
@@ -122,3 +122,23 @@ Invariants:
 - document layout cache and glyph atlas cache have separate ownership and eviction.
 
 The buffer still rebuilds its grapheme and line-start indexes on edit, and layout adjusts the position suffix when line count or height changes. Initial shaping of 10k separate logical-line runs is slower than shaping one multiline run; the viewport path keeps startup work proportional to visible lines. Benchmark measurements and memory estimates are recorded in `crates/ui-runtime/benches/text_editing.rs` and should be rerun on the target host before making performance comparisons.
+
+## Phase 10 — Accessibility semantic runtime
+
+The retained layout/interaction tree, paint output, and accessibility output are separate projections:
+
+```text
+UiTree (NodeId, layout, interaction, state)
+├── Paint → DisplayList → Renderer
+└── Semantics → SemanticTree → AccessibilityBackend → platform adapter
+```
+
+`SemanticTree` uses a persistent `NodeId ↔ AccessibilityId` mapping and caches semantic subtrees. Runtime nodes opt into `AccessibilitySemantics`; decorative nodes flatten their semantic descendants, and a hidden node excludes its whole subtree. Accessible names resolve in this order: explicit label, semantic text content, then `labelled_by` text. Debug identifiers and placeholders are not naming fallbacks. Child ordering follows the runtime tree.
+
+Node state/layout changes set `DirtyFlags::ACCESSIBILITY`; focus changes dirty the old/new focus paths, and scroll changes dirty affected bounds. Hover remains paint-only. `SemanticTree::update` reuses clean subtrees and returns deterministic `SemanticUpdate { added, changed, removed, focus_changed }` records; unchanged frames produce an empty diff. Runtime bounds are clipped world-space logical points, composed from node transforms and scroll offsets. `ui-window` converts them to platform physical pixels using the current scale factor.
+
+Platform actions enter as `AccessibilityActionRequest` and are routed back through `UiTree`: Focus uses `FocusManager`, Press emits the existing Click event path, and text value/selection actions call `TextEditor` editing and grapheme-selection APIs. Other role-specific actions dispatch `EventKind::AccessibilityAction` to application listeners. Editor owners that mutate a `TextEditor` held in `StateStore` directly call `UiTree::invalidate_accessibility` before the next semantic update.
+
+`ui-runtime` defines `AccessibilityBackend`; `HeadlessAccessibilityBackend` is the deterministic test/mock implementation. `ui-window` owns the AccessKit 0.25 / `accesskit_winit` 0.34 adapter. Its callbacks queue actions for the UI thread, and the host calls `UiWindow::process_accessibility_event` before handling each winit event, submits semantic deltas, then drains and routes actions. AccessKit receives a synthetic native Window root; runtime semantic identities remain independent. Text input maps grapheme selection to an adapter-owned TextRun node. AccessKit-dependent types do not enter `ui-runtime`.
+
+`examples/accessibility_demo` prints the semantic tree and exercises unchanged diffs, Press routing, text selection/replacement, hidden subtree omission, and a dialog reveal using only the headless backend. `crates/ui-runtime/benches/accessibility.rs` measures initial construction, unchanged frames, a single-node state update, focus movement, and diff generation over 10,000 runtime nodes with a smaller semantic subset. Native adapter compilation and headless tests verify the bridge contract; actual screen-reader behavior still requires manual OS/accessibility-tool QA.

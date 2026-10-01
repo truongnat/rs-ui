@@ -7,6 +7,9 @@ use winit::{
     window::{Window, WindowAttributes, WindowId},
 };
 
+mod accessibility;
+pub use accessibility::PlatformAccessibility;
+
 /// IME events normalized for runtime consumers. Preedit cursor offsets are grapheme indices.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PlatformImeEvent {
@@ -228,6 +231,7 @@ impl WindowMetrics {
 pub struct UiWindow {
     window: std::sync::Arc<Window>,
     metrics: WindowMetrics,
+    accessibility: PlatformAccessibility,
 }
 
 impl UiWindow {
@@ -236,6 +240,7 @@ impl UiWindow {
         config: &WindowConfig,
     ) -> Result<Self, winit::error::OsError> {
         let attributes = WindowAttributes::default()
+            .with_visible(false)
             .with_title(config.title.clone())
             .with_inner_size(LogicalSize::new(
                 config.logical_size.width,
@@ -243,7 +248,14 @@ impl UiWindow {
             ));
         let window = std::sync::Arc::new(event_loop.create_window(attributes)?);
         let metrics = WindowMetrics::from_window(&window);
-        Ok(Self { window, metrics })
+        let accessibility =
+            PlatformAccessibility::new(event_loop, &window, metrics.scale_factor.get());
+        window.set_visible(true);
+        Ok(Self {
+            window,
+            metrics,
+            accessibility,
+        })
     }
 
     pub fn id(&self) -> WindowId {
@@ -257,6 +269,8 @@ impl UiWindow {
     }
     pub fn refresh_metrics(&mut self) {
         self.metrics = WindowMetrics::from_window(&self.window);
+        self.accessibility
+            .set_scale_factor(self.metrics.scale_factor.get());
     }
     pub fn request_redraw(&self) {
         self.window.request_redraw();
@@ -269,6 +283,21 @@ impl UiWindow {
                 size.height as f32 / self.metrics.scale_factor.get(),
             );
         }
+    }
+
+    /// Feed each native window event before application event handling.
+    pub fn process_accessibility_event(&mut self, event: &winit::event::WindowEvent) {
+        self.accessibility.process_event(&self.window, event);
+    }
+
+    /// Submit a semantic delta after `SemanticTree::update` reports changes.
+    pub fn update_accessibility(&mut self, update: &ui_runtime::SemanticUpdate) {
+        self.accessibility.update(update);
+    }
+
+    /// Drain platform actions on the UI thread and route them through `SemanticTree`/`UiTree`.
+    pub fn poll_accessibility_actions(&mut self) -> Vec<ui_runtime::AccessibilityActionRequest> {
+        self.accessibility.poll_actions()
     }
 }
 

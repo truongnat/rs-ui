@@ -10,10 +10,12 @@ use ui_core::{
 };
 use ui_text::TextMetrics;
 
+mod accessibility;
 mod interaction;
 mod scroll;
 mod text_editing;
 
+pub use accessibility::*;
 pub use interaction::*;
 pub use scroll::*;
 pub use text_editing::*;
@@ -230,6 +232,8 @@ pub struct Node {
     layout: LayoutStyle,
     paint: PaintState,
     text: Option<TextContent>,
+    accessibility: Option<AccessibilitySemantics>,
+    accessibility_text: Option<String>,
     interaction: InteractionState,
     pub(crate) hit_test: HitTestState,
     pub(crate) hit_test_overridden: bool,
@@ -366,6 +370,8 @@ impl UiTree {
                 layout,
                 paint,
                 text: None,
+                accessibility: None,
+                accessibility_text: None,
                 interaction: InteractionState::default(),
                 hit_test: HitTestState::default(),
                 hit_test_overridden: false,
@@ -462,13 +468,24 @@ impl UiTree {
         id: NodeId,
         interaction: InteractionState,
     ) -> Result<(), RuntimeError> {
+        let request_focus = interaction.focused;
+        let current_focus = self.focus_manager().focused();
         let node = self
             .nodes
             .get_mut(&id)
             .ok_or(RuntimeError::UnknownNode(id))?;
+        let interaction = InteractionState {
+            focused: node.interaction.focused,
+            ..interaction
+        };
         if node.interaction != interaction {
             node.interaction = interaction;
             node.dirty.insert(DirtyFlags::PAINT);
+        }
+        if request_focus && current_focus != Some(id) {
+            let _ = self.request_focus(id)?;
+        } else if !request_focus && current_focus == Some(id) {
+            self.clear_focus();
         }
         Ok(())
     }

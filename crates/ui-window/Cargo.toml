@@ -7,4 +7,7 @@ license.workspace = true
 [dependencies]
 unicode-segmentation.workspace = true
 ui-core = { path = "../ui-core" }
+ui-runtime = { path = "../ui-runtime" }
 winit.workspace = true
+accesskit.workspace = true
+accesskit_winit.workspace = true
