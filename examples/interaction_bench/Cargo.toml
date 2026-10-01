@@ -1,0 +1,9 @@
+[package]
+name = "interaction_bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ui-core = { path = "../../crates/ui-core" }
+ui-runtime = { path = "../../crates/ui-runtime" }

@@ -11,8 +11,10 @@ use ui_core::{
 use ui_text::TextMetrics;
 
 mod interaction;
+mod scroll;
 
 pub use interaction::*;
+pub use scroll::*;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct NodeId(u64);
@@ -325,6 +327,7 @@ pub struct UiTree {
     state: StateStore,
     stats: LayoutStats,
     pub(crate) interaction_runtime: InteractionRuntime,
+    pub(crate) scroll_runtime: ScrollRuntime,
 }
 
 impl UiTree {
@@ -335,6 +338,7 @@ impl UiTree {
             state: StateStore::default(),
             stats: LayoutStats::default(),
             interaction_runtime: InteractionRuntime::default(),
+            scroll_runtime: ScrollRuntime::default(),
         }
     }
 
@@ -373,6 +377,7 @@ impl UiTree {
             self.nodes.get_mut(&parent_id).unwrap().children.push(id);
             self.invalidate_measure_chain(parent_id);
         }
+        self.interaction_runtime.mark_focus_order_dirty();
         Ok(id)
     }
 
@@ -511,6 +516,7 @@ impl UiTree {
             self.invalidate_measure_chain(parent);
         }
         self.invalidate_subtree_layout(id);
+        self.interaction_runtime.mark_focus_order_dirty();
         Ok(())
     }
 
@@ -534,6 +540,7 @@ impl UiTree {
                 pending.extend(node.children);
                 self.state.remove(next);
                 self.interaction_runtime.remove_node(next);
+                self.scroll_runtime.remove_node(next);
             }
         }
         Ok(())
@@ -556,7 +563,7 @@ impl UiTree {
             return Err(RuntimeError::UnknownNode(root));
         }
         let mut builder = DisplayListBuilder::new();
-        self.paint_node(root, &mut builder);
+        self.paint_node(root, &mut builder, Point::ZERO);
         Ok(builder.build())
     }
 
@@ -705,6 +712,7 @@ impl UiTree {
             node.dirty.remove(DirtyFlags::LAYOUT);
         }
         self.update_default_hit_test_state(id, rect);
+        self.update_scroll_viewport(id, rect.size());
         self.stats.laid_out_nodes += 1;
 
         let flow_count = children
@@ -803,11 +811,11 @@ impl UiTree {
         let _ = text_size;
     }
 
-    fn paint_node(&mut self, id: NodeId, builder: &mut DisplayListBuilder) {
+    fn paint_node(&mut self, id: NodeId, builder: &mut DisplayListBuilder, scroll: Point) {
         let Some(node) = self.nodes.get(&id) else {
             return;
         };
-        let rect = node.cache.rect;
+        let rect = translate_rect(node.cache.rect, scroll);
         let paint = node.paint;
         let text = node.text;
         let children = node.children.clone();
@@ -820,8 +828,17 @@ impl UiTree {
         if let Some(text) = text {
             builder.text(text.run, rect.min);
         }
+        let child_scroll = if let Some(offset) = self.scroll_transform(id) {
+            builder.push_clip(rect);
+            scroll - offset
+        } else {
+            scroll
+        };
         for child in children {
-            self.paint_node(child, builder);
+            self.paint_node(child, builder, child_scroll);
+        }
+        if self.scroll_transform(id).is_some() {
+            builder.pop_clip();
         }
         if let Some(node) = self.nodes.get_mut(&id) {
             node.dirty.remove(DirtyFlags::PAINT);
@@ -860,6 +877,10 @@ fn aligned_start(origin: f32, available: f32, size: f32, align: Align) -> f32 {
         Align::Center => origin + (available - size) * 0.5,
         Align::End => origin + available - size,
     }
+}
+
+fn translate_rect(rect: Rect, offset: Point) -> Rect {
+    Rect::from_min_max(rect.min + offset, rect.max + offset)
 }
 
 #[cfg(test)]

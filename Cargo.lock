@@ -690,6 +690,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "interaction_bench"
+version = "0.1.0"
+dependencies = [
+ "ui-core",
+ "ui-runtime",
+]
+
+[[package]]
 name = "jni"
 version = "0.22.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -316,12 +316,25 @@ impl FocusScope {
     }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct FocusManager {
     focused: Option<NodeId>,
     previous: Option<NodeId>,
     scopes: Vec<FocusScope>,
     traversal_order: Vec<NodeId>,
+    order_dirty: bool,
+}
+
+impl Default for FocusManager {
+    fn default() -> Self {
+        Self {
+            focused: None,
+            previous: None,
+            scopes: Vec::new(),
+            traversal_order: Vec::new(),
+            order_dirty: true,
+        }
+    }
 }
 
 impl FocusManager {
@@ -364,6 +377,10 @@ pub(crate) struct InteractionRuntime {
 }
 
 impl InteractionRuntime {
+    pub(crate) fn mark_focus_order_dirty(&mut self) {
+        self.focus.order_dirty = true;
+    }
+
     pub(crate) fn remove_node(&mut self, node: NodeId) {
         self.listeners.remove(&node);
         self.pointer.hovered_path.retain(|id| *id != node);
@@ -382,6 +399,7 @@ impl InteractionRuntime {
         }
         self.focus.traversal_order.retain(|id| *id != node);
         self.focus.scopes.retain(|scope| scope.node != node);
+        self.focus.order_dirty = true;
     }
 }
 
@@ -455,10 +473,18 @@ impl UiTree {
         {
             return None;
         }
+        let child_transform = if let Some(offset) = self.scroll_transform(node) {
+            if !target.hit_test.bounds.contains(local_position) {
+                return None;
+            }
+            Transform::translation(-offset.x, -offset.y).then(world_transform)
+        } else {
+            world_transform
+        };
         let mut children = target.children.clone();
         children.sort_by_key(|child| self.nodes[child].hit_test.z_order);
         for child in children.into_iter().rev() {
-            if let Some(mut path) = self.hit_test_node(child, position, world_transform) {
+            if let Some(mut path) = self.hit_test_node(child, position, child_transform) {
                 path.insert(0, node);
                 return Some(path);
             }
@@ -691,6 +717,9 @@ impl UiTree {
             };
             let event = self.dispatch_to_target(target, Event::new(EventKind::Wheel(event_wheel)));
             remaining = event.wheel_remaining().unwrap_or(Point::ZERO);
+            if remaining != Point::ZERO && self.scroll_state(target).is_some() {
+                remaining = self.scroll_by(target, remaining)?.remaining;
+            }
             if remaining == Point::ZERO || event.default_prevented() {
                 break;
             }
@@ -1028,7 +1057,9 @@ impl UiTree {
     }
 
     fn traverse_focus(&mut self, backwards: bool) -> Result<bool, RuntimeError> {
-        self.rebuild_focus_order();
+        if self.interaction_runtime.focus.order_dirty {
+            self.rebuild_focus_order();
+        }
         let order = if let Some(scope) = self.interaction_runtime.focus.scopes.last() {
             if scope.trap_focus {
                 self.interaction_runtime
@@ -1091,6 +1122,7 @@ impl UiTree {
         });
         self.interaction_runtime.focus.traversal_order =
             focusable.into_iter().map(|(node, _, _)| node).collect();
+        self.interaction_runtime.focus.order_dirty = false;
     }
 
     fn collect_document_order(&self, node: NodeId, order: &mut Vec<NodeId>) {
