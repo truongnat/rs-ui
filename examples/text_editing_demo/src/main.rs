@@ -1,11 +1,17 @@
-use std::time::{Duration, Instant};
+use std::{
+    ops::Range,
+    time::{Duration, Instant},
+};
 use ui_core::{Color, DisplayListBuilder, Point, Rect, Size, Srgb8, Stroke};
 use ui_renderer::{RenderFrame, RendererOptions, UiRenderer, Viewport};
 use ui_runtime::{
     Clipboard, EditCommand, FocusPolicy, LayoutStyle, PaintState, Selection, TextEditor,
     TextPosition, TextRange, UiTree,
 };
-use ui_text::{FontWeight, TextStyle, TextSystem};
+use ui_text::{
+    DirtyLineRange as LayoutDirtyLineRange, FontWeight, TextDocumentLayout, TextDocumentLine,
+    TextStyle, TextSystem,
+};
 use ui_window::{PlatformImeEvent, PlatformTextCommand, PlatformTextInput, UiWindow, WindowConfig};
 use unicode_segmentation::UnicodeSegmentation;
 use winit::{
@@ -81,9 +87,12 @@ struct Demo {
     editor_node: ui_runtime::NodeId,
     clipboard: DemoClipboard,
     text: TextSystem,
-    text_run: ui_core::TextRunId,
+    document_layout: TextDocumentLayout,
+    visible_lines: Vec<TextDocumentLine>,
     debug_run: ui_core::TextRunId,
     presentation: String,
+    presentation_lines: Vec<Range<usize>>,
+    was_composing: bool,
     modifiers: ModifiersState,
     cursor: Point,
     scroll: Point,
@@ -104,8 +113,20 @@ impl Demo {
         let mut editor = TextEditor::new(initial);
         editor.selection = Selection::caret(TextPosition::new(editor.buffer.len()));
         let presentation = editor.presentation_text();
+        let presentation_lines = line_ranges(&presentation);
         let mut text = TextSystem::new();
-        let text_run = text.shape(&presentation, style(18.0, rgb(230, 235, 244)), Some(900.0));
+        let mut document_layout =
+            TextDocumentLayout::new(editor.buffer.line_grapheme_lengths(), 26.0);
+        let visible_lines = document_layout
+            .layout_visible_lines(
+                &mut text,
+                0..24.min(document_layout.line_count()),
+                2,
+                style(18.0, rgb(230, 235, 244)),
+                Some(900.0),
+                |index| editor.buffer.line_text(index).unwrap_or_default(),
+            )
+            .expect("initial document layout");
         let debug_run = text.shape("", style(12.0, rgb(145, 159, 180)), None);
         let mut focus_tree = UiTree::new();
         let editor_node = focus_tree
@@ -132,9 +153,12 @@ impl Demo {
             editor_node,
             clipboard,
             text,
-            text_run,
+            document_layout,
+            visible_lines,
             debug_run,
             presentation,
+            presentation_lines,
+            was_composing: false,
             modifiers: ModifiersState::empty(),
             cursor: Point::ZERO,
             scroll: Point::ZERO,
@@ -206,17 +230,49 @@ impl Demo {
 
     fn update_text_runs(&mut self) {
         let next = self.editor.presentation_text();
+        let composing = self.editor.ime.is_composing();
+        let invalidations = self.editor.buffer.take_invalidations();
         if next != self.presentation {
-            self.text
-                .update_run(
-                    self.text_run,
-                    &next,
-                    style(18.0, rgb(230, 235, 244)),
-                    Some(900.0),
-                )
-                .expect("text run");
+            if !self.was_composing && !composing && !invalidations.is_empty() {
+                for invalidation in invalidations {
+                    self.document_layout
+                        .apply_edit(
+                            &mut self.text,
+                            LayoutDirtyLineRange {
+                                start: invalidation.lines.start,
+                                removed: invalidation.lines.removed,
+                                inserted: invalidation.lines.inserted,
+                            },
+                            &invalidation.inserted_line_grapheme_lengths,
+                            26.0,
+                        )
+                        .expect("editor emitted a valid dirty line range");
+                }
+            } else if let Some((start, removed, inserted_lengths)) =
+                changed_line_splice(&self.presentation, &next)
+            {
+                self.document_layout
+                    .apply_edit(
+                        &mut self.text,
+                        LayoutDirtyLineRange {
+                            start,
+                            removed,
+                            inserted: inserted_lengths.len(),
+                        },
+                        &inserted_lengths,
+                        26.0,
+                    )
+                    .expect("presentation diff produced a valid dirty line range");
+            }
             self.presentation = next;
+            self.presentation_lines = line_ranges(&self.presentation);
         }
+        self.was_composing = composing;
+        self.refresh_visible_lines();
+        self.update_debug_run();
+    }
+
+    fn update_debug_run(&mut self) {
         let debug = format!(
             "caret={}  selection={}:{}  composition={:?}  undo={} redo={}  focused={}  scroll=({:.0},{:.0})",
             self.editor.selection.head.grapheme_index(),
@@ -237,6 +293,32 @@ impl Demo {
                 None,
             )
             .expect("debug run");
+    }
+
+    fn refresh_visible_lines(&mut self) {
+        let viewport = self.viewport();
+        let visible = self
+            .document_layout
+            .visible_line_range(self.scroll.y, viewport.height());
+        let content = &self.presentation;
+        let ranges = &self.presentation_lines;
+        let width = (viewport.width() - 24.0).max(100.0);
+        self.visible_lines = self
+            .document_layout
+            .layout_visible_lines(
+                &mut self.text,
+                visible,
+                2,
+                style(18.0, rgb(230, 235, 244)),
+                Some(width),
+                |index| {
+                    ranges
+                        .get(index)
+                        .map(|range| content[range.clone()].to_owned())
+                        .unwrap_or_default()
+                },
+            )
+            .expect("visible document layout");
     }
 
     fn viewport(&self) -> Rect {
@@ -260,18 +342,35 @@ impl Demo {
     }
     fn hit_position(&self, point: Point) -> TextPosition {
         TextPosition::new(
-            self.text
-                .point_to_position(self.text_run, self.text_point(point))
+            self.document_layout
+                .hit_test(&self.text, self.text_point(point))
                 .unwrap_or(self.editor.buffer.len())
                 .min(self.editor.buffer.len()),
         )
     }
     fn ensure_caret_visible(&mut self) {
-        let Some(rect) = self.text.caret_rect(
-            self.text_run,
-            self.editor.selection.head.grapheme_index(),
-            1.5,
-        ) else {
+        let caret_index = self.editor.selection.head.grapheme_index();
+        let caret_line = self.editor.buffer.line_index(self.editor.selection.head);
+        let content = &self.presentation;
+        let ranges = &self.presentation_lines;
+        let width = (self.viewport().width() - 24.0).max(100.0);
+        let _ = self.document_layout.layout_visible_lines(
+            &mut self.text,
+            caret_line..caret_line.saturating_add(1),
+            2,
+            style(18.0, rgb(230, 235, 244)),
+            Some(width),
+            |index| {
+                ranges
+                    .get(index)
+                    .map(|range| content[range.clone()].to_owned())
+                    .unwrap_or_default()
+            },
+        );
+        let Some(rect) = self
+            .document_layout
+            .caret_rect(&self.text, caret_index, 1.5)
+        else {
             return;
         };
         let viewport = self.viewport();
@@ -296,16 +395,32 @@ impl Demo {
 
     fn apply_command(&mut self, command: EditCommand) {
         let extend = self.modifiers.shift_key();
-        self.editor.execute_with_layout(
+        let changes_text = matches!(
+            &command,
+            EditCommand::InsertText(_)
+                | EditCommand::DeleteBackward
+                | EditCommand::DeleteForward
+                | EditCommand::DeleteWordBackward
+                | EditCommand::DeleteWordForward
+                | EditCommand::Cut
+                | EditCommand::Paste
+                | EditCommand::Undo
+                | EditCommand::Redo
+        );
+        self.editor.execute_with_document_layout(
             command,
             &mut self.clipboard,
             &self.text,
-            self.text_run,
+            &self.document_layout,
             extend,
         );
         self.blink_started = Instant::now();
         self.caret_blink_visible = true;
-        self.update_text_runs();
+        if changes_text {
+            self.update_text_runs();
+        } else {
+            self.update_debug_run();
+        }
         self.ensure_caret_visible();
         if let Some(window) = &self.window {
             window.request_redraw();
@@ -324,6 +439,7 @@ impl Demo {
         }
         if !self.focused {
             self.editor.ime_cancel();
+            self.update_text_runs();
         }
         self.blink_started = Instant::now();
         self.caret_blink_visible = true;
@@ -439,7 +555,8 @@ impl Demo {
     }
 
     fn redraw(&mut self) {
-        self.update_text_runs();
+        self.refresh_visible_lines();
+        self.update_debug_run();
         if self.surface_occluded {
             return;
         }
@@ -448,7 +565,8 @@ impl Demo {
         if self.focused
             && let (Some(window), Some(caret)) = (
                 self.window.as_ref(),
-                self.text.caret_rect(self.text_run, caret_index, 1.5),
+                self.document_layout
+                    .caret_rect(&self.text, caret_index, 1.5),
             )
         {
             window.window().set_ime_cursor_area(
@@ -510,16 +628,20 @@ impl Demo {
         list.push_clip(viewport);
         let origin = Point::new(TEXT_ORIGIN.x - self.scroll.x, TEXT_ORIGIN.y - self.scroll.y);
         let composing = self.editor.ime.is_composing();
+        let line_range = self.visible_lines.first().map_or(0..0, |first| {
+            first.logical_index
+                ..self
+                    .visible_lines
+                    .last()
+                    .map_or(first.logical_index, |last| last.logical_index + 1)
+        });
         if !composing {
-            for rect in self
-                .text
-                .selection_rects(
-                    self.text_run,
-                    self.editor.selection.range().start.grapheme_index(),
-                    self.editor.selection.range().end.grapheme_index(),
-                )
-                .unwrap_or_default()
-            {
+            for rect in self.document_layout.selection_rects_in_range(
+                &self.text,
+                self.editor.selection.range().start.grapheme_index(),
+                self.editor.selection.range().end.grapheme_index(),
+                line_range.clone(),
+            ) {
                 list.fill_rect(
                     Rect::from_min_size(
                         Point::new(rect.min.x + origin.x, rect.min.y + origin.y),
@@ -536,11 +658,12 @@ impl Demo {
             let base = range.start.grapheme_index();
             let selection_start = base + cursor.start.grapheme_index();
             let selection_end = base + cursor.end.grapheme_index();
-            for rect in self
-                .text
-                .selection_rects(self.text_run, selection_start, selection_end)
-                .unwrap_or_default()
-            {
+            for rect in self.document_layout.selection_rects_in_range(
+                &self.text,
+                selection_start,
+                selection_end,
+                line_range.clone(),
+            ) {
                 list.fill_rect(
                     Rect::from_min_size(
                         Point::new(rect.min.x + origin.x, rect.min.y + origin.y),
@@ -550,15 +673,18 @@ impl Demo {
                 );
             }
         }
-        list.text(self.text_run, origin);
+        for line in &self.visible_lines {
+            list.text(line.run, Point::new(origin.x, origin.y + line.top));
+        }
         if composing && let Some(range) = self.editor.ime.composing_range {
             let start = range.start.grapheme_index();
             let end = start + self.editor.ime.preedit_text.graphemes(true).count();
-            for rect in self
-                .text
-                .selection_rects(self.text_run, start, end)
-                .unwrap_or_default()
-            {
+            for rect in self.document_layout.selection_rects_in_range(
+                &self.text,
+                start,
+                end,
+                line_range.clone(),
+            ) {
                 let y = rect.max.y + origin.y - 2.0;
                 list.line(
                     Point::new(rect.min.x + origin.x, y),
@@ -569,7 +695,9 @@ impl Demo {
         }
         if self.focused
             && self.caret_blink_visible
-            && let Some(caret) = self.text.caret_rect(self.text_run, caret_index, 1.5)
+            && let Some(caret) = self
+                .document_layout
+                .caret_rect(&self.text, caret_index, 1.5)
         {
             list.fill_rect(
                 Rect::from_min_size(
@@ -655,16 +783,20 @@ impl ApplicationHandler for Demo {
             WindowEvent::Focused(focused) => {
                 self.set_editor_focus(focused);
             }
-            WindowEvent::Ime(event) if self.focused => match PlatformImeEvent::from(event) {
-                PlatformImeEvent::Enabled => self.editor.ime_start(),
-                PlatformImeEvent::Preedit { text, cursor } => {
-                    let cursor = cursor
-                        .map(|(a, b)| TextRange::new(TextPosition::new(a), TextPosition::new(b)));
-                    self.editor.ime_preedit(&text, cursor);
+            WindowEvent::Ime(event) if self.focused => {
+                match PlatformImeEvent::from(event) {
+                    PlatformImeEvent::Enabled => self.editor.ime_start(),
+                    PlatformImeEvent::Preedit { text, cursor } => {
+                        let cursor = cursor.map(|(a, b)| {
+                            TextRange::new(TextPosition::new(a), TextPosition::new(b))
+                        });
+                        self.editor.ime_preedit(&text, cursor);
+                    }
+                    PlatformImeEvent::Commit(text) => self.editor.ime_commit(&text),
+                    PlatformImeEvent::Disabled => self.editor.ime_cancel(),
                 }
-                PlatformImeEvent::Commit(text) => self.editor.ime_commit(&text),
-                PlatformImeEvent::Disabled => self.editor.ime_cancel(),
-            },
+                self.update_text_runs();
+            }
             WindowEvent::KeyboardInput { event, .. } => {
                 self.key_input(PlatformTextInput::from_winit(&event, self.modifiers))
             }
@@ -676,7 +808,7 @@ impl ApplicationHandler for Demo {
                 if self.dragging {
                     let p = self.hit_position(self.cursor);
                     self.editor.pointer_drag_to(p);
-                    self.update_text_runs();
+                    self.update_debug_run();
                 }
             }
             WindowEvent::MouseInput {
@@ -709,7 +841,7 @@ impl ApplicationHandler for Demo {
                     }
                     self.blink_started = Instant::now();
                     self.caret_blink_visible = true;
-                    self.update_text_runs();
+                    self.update_debug_run();
                 } else {
                     self.dragging = false;
                 }
@@ -756,6 +888,44 @@ impl ApplicationHandler for Demo {
     }
 }
 
+fn line_ranges(text: &str) -> Vec<Range<usize>> {
+    let mut ranges = Vec::new();
+    let mut start = 0;
+    for (index, character) in text.char_indices() {
+        if character == '\n' {
+            ranges.push(start..index);
+            start = index + character.len_utf8();
+        }
+    }
+    ranges.push(start..text.len());
+    ranges
+}
+
+fn changed_line_splice(old: &str, new: &str) -> Option<(usize, usize, Vec<usize>)> {
+    let old_ranges = line_ranges(old);
+    let new_ranges = line_ranges(new);
+    let old_line = |index: usize| &old[old_ranges[index].clone()];
+    let new_line = |index: usize| &new[new_ranges[index].clone()];
+    let mut prefix = 0;
+    while prefix < old_ranges.len().min(new_ranges.len()) && old_line(prefix) == new_line(prefix) {
+        prefix += 1;
+    }
+    let mut old_end = old_ranges.len();
+    let mut new_end = new_ranges.len();
+    while old_end > prefix && new_end > prefix && old_line(old_end - 1) == new_line(new_end - 1) {
+        old_end -= 1;
+        new_end -= 1;
+    }
+    if old_end == prefix && new_end == prefix {
+        return None;
+    }
+    let inserted_lengths = new_ranges[prefix..new_end]
+        .iter()
+        .map(|range| new[range.clone()].graphemes(true).count())
+        .collect();
+    Some((prefix, old_end - prefix, inserted_lengths))
+}
+
 fn style(size: f32, color: Color) -> TextStyle {
     TextStyle {
         size_px: size,
@@ -795,12 +965,8 @@ fn run_headless_smoke() -> Result<(), Box<dyn std::error::Error>> {
     demo.editor.ime_commit("候補");
     demo.update_text_runs();
     if demo
-        .text
-        .caret_rect(
-            demo.text_run,
-            demo.editor.selection.head.grapheme_index(),
-            1.0,
-        )
+        .document_layout
+        .caret_rect(&demo.text, demo.editor.selection.head.grapheme_index(), 1.0)
         .is_none()
     {
         return Err("caret geometry smoke failed".into());
@@ -809,16 +975,10 @@ fn run_headless_smoke() -> Result<(), Box<dyn std::error::Error>> {
         anchor: TextPosition::new(0),
         head: TextPosition::new(demo.editor.buffer.len()),
     };
-    demo.text.update_run(
-        demo.text_run,
-        &demo.editor.presentation_text(),
-        style(18.0, rgb(230, 235, 244)),
-        Some(900.0),
-    )?;
     if demo
-        .text
-        .selection_rects(demo.text_run, 0, demo.editor.buffer.len())
-        .is_none()
+        .document_layout
+        .selection_rects(&demo.text, 0, demo.editor.buffer.len())
+        .is_empty()
     {
         return Err("selection geometry smoke failed".into());
     }

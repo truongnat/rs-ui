@@ -1,7 +1,8 @@
 //! Platform-neutral text editing state. Positions are grapheme-cluster indices.
 use std::ops::Range;
+pub use ui_core::DirtyLineRange;
 use ui_core::{Point, TextRunId};
-use ui_text::TextSystem;
+use ui_text::{TextDocumentLayout, TextSystem};
 use unicode_segmentation::UnicodeSegmentation;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -19,6 +20,19 @@ impl TextPosition {
 pub struct TextRange {
     pub start: TextPosition,
     pub end: TextPosition,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DirtyTextRange {
+    pub before: TextRange,
+    pub after: TextRange,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TextEditInvalidation {
+    pub text: DirtyTextRange,
+    pub lines: DirtyLineRange,
+    pub inserted_line_grapheme_lengths: Vec<usize>,
 }
 impl TextRange {
     pub fn new(a: TextPosition, b: TextPosition) -> Self {
@@ -103,6 +117,8 @@ impl Selection {
 pub struct TextBuffer {
     text: String,
     grapheme_offsets: Vec<usize>,
+    line_starts: Vec<usize>,
+    invalidations: Vec<TextEditInvalidation>,
 }
 impl TextBuffer {
     pub fn new(text: impl Into<String>) -> Self {
@@ -112,9 +128,12 @@ impl TextBuffer {
             .map(|(index, _)| index)
             .collect::<Vec<_>>();
         grapheme_offsets.push(text.len());
+        let line_starts = line_starts(&text);
         Self {
             text,
             grapheme_offsets,
+            line_starts,
+            invalidations: Vec::new(),
         }
     }
     pub fn text(&self) -> String {
@@ -127,13 +146,12 @@ impl TextBuffer {
         self.text.is_empty()
     }
     pub fn line_count(&self) -> usize {
-        self.text.split('\n').count()
+        self.line_starts.len()
     }
     pub fn line_index(&self, p: TextPosition) -> usize {
-        self.text[..self.byte_offset(self.clamp(p))]
-            .bytes()
-            .filter(|b| *b == b'\n')
-            .count()
+        self.line_starts
+            .partition_point(|start| *start <= self.byte_offset(self.clamp(p)))
+            .saturating_sub(1)
     }
     pub fn clamp(&self, p: TextPosition) -> TextPosition {
         TextPosition(p.0.min(self.len()))
@@ -143,17 +161,39 @@ impl TextBuffer {
         self.text[r].to_owned()
     }
     pub fn line_range(&self, line: usize) -> Option<TextRange> {
-        let mut start = 0;
-        for (i, content) in self.text.split('\n').enumerate() {
-            if i == line {
-                return Some(TextRange::new(
-                    TextPosition(start),
-                    TextPosition(start + content.graphemes(true).count()),
-                ));
-            }
-            start += content.graphemes(true).count() + 1;
-        }
-        None
+        let start_byte = *self.line_starts.get(line)?;
+        let end_byte = self
+            .line_starts
+            .get(line + 1)
+            .map_or(self.text.len(), |next| next - 1);
+        Some(TextRange::new(
+            self.position_at_or_after_byte(start_byte),
+            self.position_at_or_after_byte(end_byte),
+        ))
+    }
+    pub fn line_text(&self, line: usize) -> Option<String> {
+        let start = *self.line_starts.get(line)?;
+        let end = self
+            .line_starts
+            .get(line + 1)
+            .map_or(self.text.len(), |next| next - 1);
+        Some(self.text[start..end].to_owned())
+    }
+    pub fn line_grapheme_lengths(&self) -> Vec<usize> {
+        self.line_starts
+            .iter()
+            .enumerate()
+            .map(|(line, start)| {
+                let end = self
+                    .line_starts
+                    .get(line + 1)
+                    .map_or(self.text.len(), |next| next - 1);
+                self.text[*start..end].graphemes(true).count()
+            })
+            .collect()
+    }
+    pub fn take_invalidations(&mut self) -> Vec<TextEditInvalidation> {
+        std::mem::take(&mut self.invalidations)
     }
     pub fn insert(&mut self, at: TextPosition, text: &str) -> String {
         self.replace(TextRange::new(self.clamp(at), self.clamp(at)), text)
@@ -168,6 +208,39 @@ impl TextBuffer {
         deleted
     }
     fn replace_bytes(&mut self, bytes: Range<usize>, text: &str) {
+        let old = self.text[bytes.clone()].to_owned();
+        if old == text {
+            return;
+        }
+        let start = self.position_at_or_after_byte(bytes.start);
+        let end = self.position_at_or_after_byte(bytes.end);
+        let byte_start = bytes.start;
+        let line_start = self
+            .line_starts
+            .partition_point(|offset| *offset <= bytes.start)
+            .saturating_sub(1);
+        let removed = self.text[bytes.clone()]
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count()
+            + 1;
+        let old_line_start = self.line_starts[line_start];
+        let old_line_end = self
+            .line_starts
+            .get(line_start + removed)
+            .map_or(self.text.len(), |next| next - 1)
+            .max(bytes.end);
+        let mut replacement_lines = String::with_capacity(
+            bytes.start - old_line_start + text.len() + old_line_end - bytes.end,
+        );
+        replacement_lines.push_str(&self.text[old_line_start..bytes.start]);
+        replacement_lines.push_str(text);
+        replacement_lines.push_str(&self.text[bytes.end..old_line_end]);
+        let inserted_line_grapheme_lengths: Vec<usize> = replacement_lines
+            .split('\n')
+            .map(|line| line.graphemes(true).count())
+            .collect();
+        let inserted = inserted_line_grapheme_lengths.len();
         self.text.replace_range(bytes, text);
         self.grapheme_offsets = self
             .text
@@ -175,6 +248,21 @@ impl TextBuffer {
             .map(|(index, _)| index)
             .chain(std::iter::once(self.text.len()))
             .collect();
+        self.line_starts = line_starts(&self.text);
+        let after_start = self.position_at_or_after_byte(byte_start);
+        let after_end = self.position_at_or_after_byte(byte_start + text.len());
+        self.invalidations.push(TextEditInvalidation {
+            text: DirtyTextRange {
+                before: TextRange::new(start, end),
+                after: TextRange::new(after_start, after_end),
+            },
+            lines: DirtyLineRange {
+                start: line_start,
+                removed,
+                inserted,
+            },
+            inserted_line_grapheme_lengths,
+        });
     }
     fn position_at_or_after_byte(&self, byte: usize) -> TextPosition {
         TextPosition(
@@ -249,6 +337,13 @@ impl TextBuffer {
         self.grapheme_offsets[p.0]
     }
 }
+
+fn line_starts(text: &str) -> Vec<usize> {
+    std::iter::once(0)
+        .chain(text.match_indices('\n').map(|(index, _)| index + 1))
+        .collect()
+}
+
 impl Default for TextBuffer {
     fn default() -> Self {
         Self::new(String::new())
@@ -546,6 +641,78 @@ impl TextEditor {
             }
             other => self.execute(other, clipboard),
         }
+    }
+
+    pub fn execute_with_document_layout(
+        &mut self,
+        command: EditCommand,
+        clipboard: &mut impl Clipboard,
+        text: &TextSystem,
+        layout: &TextDocumentLayout,
+        extend: bool,
+    ) {
+        let (line_end, command_extends) = match command {
+            EditCommand::MoveLineStart => (false, false),
+            EditCommand::MoveLineEnd => (true, false),
+            EditCommand::ExtendLineStart => (false, true),
+            EditCommand::ExtendLineEnd => (true, true),
+            _ => (false, false),
+        };
+        if matches!(
+            command,
+            EditCommand::MoveLineStart
+                | EditCommand::MoveLineEnd
+                | EditCommand::ExtendLineStart
+                | EditCommand::ExtendLineEnd
+        ) {
+            if let Some(position) =
+                layout.visual_line_boundary(text, self.selection.head.grapheme_index(), line_end)
+            {
+                let target = self.buffer.clamp(TextPosition::new(position));
+                if extend || command_extends {
+                    self.extend_to(target);
+                } else {
+                    self.navigate(target, line_end);
+                }
+                self.preferred_x = None;
+            } else {
+                self.execute(command, clipboard);
+            }
+            return;
+        }
+        let (down, command_extends) = match command {
+            EditCommand::MoveUp => (false, false),
+            EditCommand::MoveDown => (true, false),
+            _ => {
+                self.execute(command, clipboard);
+                return;
+            }
+        };
+        let position = self.selection.head.grapheme_index();
+        let Some(point) = layout.position_to_point(text, position) else {
+            self.execute(command, clipboard);
+            return;
+        };
+        let Some(caret) = layout.caret_rect(text, position, 0.0) else {
+            self.execute(command, clipboard);
+            return;
+        };
+        let x = self.preferred_x.unwrap_or(point.x);
+        let delta = caret.height().max(1.0);
+        let target = Point::new(x, point.y + if down { delta } else { -delta });
+        let Some(position) = layout.hit_test(text, target) else {
+            self.execute(command, clipboard);
+            return;
+        };
+        self.undo.break_group();
+        self.ime_cancel();
+        if extend || command_extends {
+            self.selection
+                .extend_to(self.buffer.clamp(TextPosition::new(position)));
+        } else {
+            self.selection = Selection::caret(TextPosition::new(position));
+        }
+        self.preferred_x = Some(x);
     }
     pub fn move_visual_line_boundary(
         &mut self,
@@ -1020,5 +1187,185 @@ mod tests {
         let second_start = TextPosition(first_line.end.grapheme_index() + 1);
         assert_eq!(b.line_start(second_start), second_start);
         assert_eq!(b.line_end(first_line.end), first_line.end);
+    }
+
+    #[test]
+    fn line_indexing_and_dirty_ranges_cover_split_merge_and_multiline_replacement() {
+        let mut buffer = TextBuffer::new("A\nB\nC");
+        assert_eq!(buffer.line_count(), 3);
+        assert_eq!(buffer.line_text(1).as_deref(), Some("B"));
+        assert_eq!(buffer.line_index(TextPosition::new(2)), 1);
+
+        buffer.insert(TextPosition::new(2), "\n");
+        assert_eq!(buffer.line_count(), 4);
+        assert_eq!(buffer.line_text(1).as_deref(), Some(""));
+        assert_eq!(buffer.line_text(2).as_deref(), Some("B"));
+        let split = buffer.take_invalidations();
+        assert_eq!(split.len(), 1);
+        assert_eq!(
+            split[0].lines,
+            DirtyLineRange {
+                start: 1,
+                removed: 1,
+                inserted: 2
+            }
+        );
+        assert_eq!(split[0].inserted_line_grapheme_lengths, vec![0, 1]);
+
+        buffer.delete(TextRange::new(TextPosition::new(1), TextPosition::new(2)));
+        assert_eq!(buffer.line_count(), 3);
+        let merge = buffer.take_invalidations();
+        assert_eq!(
+            merge[0].lines,
+            DirtyLineRange {
+                start: 0,
+                removed: 2,
+                inserted: 1
+            }
+        );
+        assert_eq!(merge[0].inserted_line_grapheme_lengths, vec![1]);
+
+        buffer.replace(
+            TextRange::new(TextPosition::new(0), TextPosition::new(buffer.len())),
+            "x\ny\nz",
+        );
+        let paste = buffer.take_invalidations();
+        assert_eq!(paste[0].lines.removed, 3);
+        assert_eq!(paste[0].lines.inserted, 3);
+        assert_eq!(paste[0].inserted_line_grapheme_lengths, vec![1, 1, 1]);
+
+        let mut trailing_newline = TextBuffer::new("A\n");
+        trailing_newline.delete(TextRange::new(TextPosition::new(1), TextPosition::new(2)));
+        assert_eq!(trailing_newline.text(), "A");
+        assert_eq!(
+            trailing_newline.take_invalidations()[0].inserted_line_grapheme_lengths,
+            vec![1]
+        );
+    }
+
+    #[test]
+    fn paste_ime_commit_undo_and_redo_all_emit_line_invalidations() {
+        let mut editor = TextEditor::new("A\nB\nC");
+        let mut clipboard = MemClipboard(Some("x\ny".into()));
+        editor.selection = Selection::caret(TextPosition::new(2));
+        editor.execute(EditCommand::Paste, &mut clipboard);
+        let paste = editor.buffer.take_invalidations();
+        assert_eq!(paste.len(), 1);
+        assert_eq!(
+            paste[0].lines,
+            DirtyLineRange {
+                start: 1,
+                removed: 1,
+                inserted: 2
+            }
+        );
+        assert_eq!(paste[0].inserted_line_grapheme_lengths, vec![1, 2]);
+
+        editor.execute(EditCommand::Undo, &mut clipboard);
+        let undo = editor.buffer.take_invalidations();
+        assert_eq!(undo.len(), 1);
+        assert_eq!(undo[0].lines.removed, 2);
+        assert_eq!(undo[0].lines.inserted, 1);
+        editor.execute(EditCommand::Redo, &mut clipboard);
+        assert_eq!(editor.buffer.take_invalidations().len(), 1);
+
+        let before_ime = editor.buffer.text();
+        editor.ime_start();
+        editor.ime_preedit("候補\n", None);
+        assert!(editor.buffer.take_invalidations().is_empty());
+        editor.ime_commit("候補\n");
+        let commit = editor.buffer.take_invalidations();
+        assert_eq!(commit.len(), 1);
+        assert_eq!(commit[0].lines.inserted, 2);
+        assert_ne!(editor.buffer.text(), before_ime);
+    }
+
+    #[test]
+    fn document_layout_edit_undo_redo_and_ime_commit_only_reshape_the_changed_line() {
+        let mut editor = TextEditor::new("A\nB\nC\nD");
+        let mut clipboard = MemClipboard::default();
+        let mut text = ui_text::TextSystem::new();
+        let mut layout =
+            ui_text::TextDocumentLayout::new(editor.buffer.line_grapheme_lengths(), 20.0);
+        let initial = layout
+            .layout_visible_lines(
+                &mut text,
+                0..4,
+                0,
+                ui_text::TextStyle::default(),
+                None,
+                |i| editor.buffer.line_text(i).unwrap_or_default(),
+            )
+            .unwrap();
+
+        editor.selection = Selection::caret(TextPosition::new(5));
+        editor.execute(EditCommand::InsertText("!".into()), &mut clipboard);
+        apply_pending_layout_edits(&mut editor, &mut layout, &mut text);
+        let before = text.shape_call_count();
+        let edited = layout
+            .layout_visible_lines(
+                &mut text,
+                0..4,
+                0,
+                ui_text::TextStyle::default(),
+                None,
+                |i| editor.buffer.line_text(i).unwrap_or_default(),
+            )
+            .unwrap();
+        assert_eq!(text.shape_call_count() - before, 1);
+        assert_eq!(initial[0].run, edited[0].run);
+        assert_eq!(initial[1].run, edited[1].run);
+        assert_eq!(initial[3].run, edited[3].run);
+
+        editor.execute(EditCommand::Undo, &mut clipboard);
+        apply_pending_layout_edits(&mut editor, &mut layout, &mut text);
+        let before = text.shape_call_count();
+        layout
+            .layout_visible_lines(
+                &mut text,
+                0..4,
+                0,
+                ui_text::TextStyle::default(),
+                None,
+                |i| editor.buffer.line_text(i).unwrap_or_default(),
+            )
+            .unwrap();
+        assert_eq!(text.shape_call_count() - before, 1);
+
+        editor.selection = Selection::caret(TextPosition::new(5));
+        editor.ime_start();
+        editor.ime_preedit("候補", None);
+        assert!(editor.buffer.take_invalidations().is_empty());
+        editor.ime_commit("?");
+        apply_pending_layout_edits(&mut editor, &mut layout, &mut text);
+        let before = text.shape_call_count();
+        layout
+            .layout_visible_lines(
+                &mut text,
+                0..4,
+                0,
+                ui_text::TextStyle::default(),
+                None,
+                |i| editor.buffer.line_text(i).unwrap_or_default(),
+            )
+            .unwrap();
+        assert_eq!(text.shape_call_count() - before, 1);
+    }
+
+    fn apply_pending_layout_edits(
+        editor: &mut TextEditor,
+        layout: &mut ui_text::TextDocumentLayout,
+        text: &mut ui_text::TextSystem,
+    ) {
+        for invalidation in editor.buffer.take_invalidations() {
+            layout
+                .apply_edit(
+                    text,
+                    invalidation.lines,
+                    &invalidation.inserted_line_grapheme_lengths,
+                    20.0,
+                )
+                .unwrap();
+        }
     }
 }

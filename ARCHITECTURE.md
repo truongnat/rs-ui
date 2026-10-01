@@ -87,6 +87,38 @@ Scroll offsets are applied as a content translation during hit testing and paint
 
 `ui-window::PlatformImeEvent` maps winit IME events into a platform-neutral event shape and converts preedit byte cursor offsets to grapheme offsets. `PlatformTextInput` keeps key/modifier mapping at the platform seam. Hosts gate input through `FocusManager`, provide a `Clipboard`, request IME enable/disable, and dispatch normalized input to `TextEditor`.
 
-`ui-text` exposes logical-position hit testing, caret rectangles, selection spans, and visual line metrics from cosmic-text layout. `examples/text_editing_demo` connects mouse selection, keyboard commands, `FocusManager`, OS clipboard with a local fallback, undo/redo, IME events, caret blink/paint, scrolling, and debug state. Vertical movement uses shaped geometry and preferred X; Home/End resolve visual wrapped lines. A release benchmark covers 10k characters, 10k lines, cursor movement, edits, repeated unchanged shaping, hit testing, and selection geometry.
+`ui-text` exposes logical-position hit testing, caret rectangles, selection spans, and visual line metrics from cosmic-text layout. `examples/text_editing_demo` connects mouse selection, keyboard commands, `FocusManager`, OS clipboard with a local fallback, undo/redo, IME events, caret blink/paint, scrolling, and debug state. Vertical movement uses shaped geometry and preferred X; Home/End resolve visual wrapped lines. The release benchmark covers 10k-line shape/layout, unchanged frames, single-line edits, newline insertion, multiline paste, and a 100k-line viewport.
 
-The demo uses arboard for the OS clipboard and falls back to an in-memory clipboard with an explicit error message if the native backend is unavailable. Visual QA could not run because the current window surface reported `Occluded`; the headless smoke and logical geometry tests passed. Editing text rebuilds its grapheme-offset table, and `ui-text::update_run` reshapes the full run even when unchanged. Unchanged-run shaping cache and incremental per-line layout are follow-on performance work; callers can keep separate stable `TextRunId`s per line and update only changed runs. Renderer remains unaware of editor state.
+The demo uses arboard for the OS clipboard and falls back to an in-memory clipboard with an explicit error message if the native backend is unavailable. Visual QA could not run because the current window surface reported `Occluded`; the headless smoke and logical geometry tests passed. Renderer remains unaware of editor state.
+
+## Phase 9.5 — Incremental text layout
+
+The text path now follows this sequence:
+
+```text
+TextBuffer
+    ↓ logical edits
+DirtyTextRange + DirtyLineRange
+    ↓ line splice
+TextDocumentLayout
+    ↓ visible line range + overscan
+per-line TextRunCache / shaped buffers
+    ↓ visible runs
+DisplayList
+```
+
+`TextBuffer` emits edit invalidations for insert, delete, multiline paste, IME commit, undo, and redo. A line splice carries the old start/count and grapheme lengths of the replacement lines, including unchanged prefix/suffix text within affected lines. The text layout cache applies that splice while retaining the shaped runs for unaffected lines. Callers must apply these invalidations before asking for layout; unchanged cached lines are trusted and their source text is not fetched again.
+
+`TextDocumentLayout` retains per-line run identity, shaping style/constraint keys, metrics, grapheme start, position, and LRU use. `layout_visible_lines` reads/shapes only the requested visible range plus overscan. A configurable cache limit evicts shaped runs outside that range; evicted lines retain logical metadata and are shaped again when requested. Text content is owned once by the active shaped run rather than copied into a second line-cache string. Its memory estimate includes line metadata, text bytes, and glyph-position storage, but excludes cosmic-text's private buffers and allocator overhead.
+
+Revisions are separated into document, per-line, shaping style, and layout constraints. Color changes update the cached run color without shaping. Wrap-width changes reshape only visible lines under the new constraint; rasterization remains deferred to `prepare` and uses the independent glyph-atlas cache. Viewport movement requests visible lines and shapes only cache misses. Hit testing, caret geometry, selection spans, and visual Home/End query cached line runs.
+
+Invariants:
+
+- editing state remains the source of truth for grapheme positions, selection, IME, and undo/redo;
+- a logical edit invalidates only its affected line splice; later line positions may be recomputed without reshaping their text;
+- unchanged cached lines do not fetch source text or recompute line metrics;
+- viewport changes do not invalidate text, and hit tests do not shape text;
+- document layout cache and glyph atlas cache have separate ownership and eviction.
+
+The buffer still rebuilds its grapheme and line-start indexes on edit, and layout adjusts the position suffix when line count or height changes. Initial shaping of 10k separate logical-line runs is slower than shaping one multiline run; the viewport path keeps startup work proportional to visible lines. Benchmark measurements and memory estimates are recorded in `crates/ui-runtime/benches/text_editing.rs` and should be rerun on the target host before making performance comparisons.

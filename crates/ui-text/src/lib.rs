@@ -1,14 +1,16 @@
 //! Text shaping and CPU glyph-atlas preparation for desktop UI rendering.
 
 use std::collections::HashMap;
+use std::mem::size_of;
+use std::ops::Range;
 use std::sync::Arc;
 
 use cosmic_text::{
     Attrs, Buffer, Cursor, Family, FontSystem, Metrics, Shaping, SwashCache, Weight,
 };
 use swash::scale::image::Content as SwashContent;
-pub use ui_core::TextRunId;
 use ui_core::{Color, Point, Rect, Size};
+pub use ui_core::{DirtyLineRange, TextRunId};
 use unicode_segmentation::UnicodeSegmentation;
 
 const DEFAULT_ATLAS_SIZE: u32 = 1024;
@@ -74,6 +76,82 @@ pub struct TextLineMetrics {
     pub baseline: f32,
     pub height: f32,
     pub width: f32,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LayoutRevision(pub u64);
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TextDocumentLayoutStats {
+    pub lines_invalidated: u64,
+    pub lines_shaped: u64,
+    pub cache_hits: u64,
+    pub lines_materialized: u64,
+    pub lines_evicted: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TextLayoutRevisions {
+    pub document: LayoutRevision,
+    pub style: LayoutRevision,
+    pub constraints: LayoutRevision,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TextDocumentLine {
+    pub logical_index: usize,
+    pub revision: LayoutRevision,
+    pub run: TextRunId,
+    pub grapheme_start: usize,
+    pub top: f32,
+    pub height: f32,
+    pub metrics: TextMetrics,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ShapeKey {
+    family: FontFamily,
+    weight: FontWeight,
+    size_px: u32,
+    line_height_px: u32,
+    width: Option<u32>,
+}
+
+impl ShapeKey {
+    fn new(style: TextStyle, width: Option<f32>) -> Self {
+        Self {
+            family: style.family,
+            weight: style.weight,
+            size_px: style.size_px.to_bits(),
+            line_height_px: style.line_height_px.to_bits(),
+            width: width.map(f32::to_bits),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct CachedDocumentLine {
+    revision: LayoutRevision,
+    run: Option<TextRunId>,
+    shape_key: Option<ShapeKey>,
+    grapheme_len: usize,
+    grapheme_start: usize,
+    top: f32,
+    height: f32,
+    metrics: TextMetrics,
+    color: Option<Color>,
+    last_used: u64,
+}
+
+/// Per-logical-line shaping cache. Text content remains owned by TextSystem's shaped runs.
+#[derive(Debug)]
+pub struct TextDocumentLayout {
+    lines: Vec<CachedDocumentLine>,
+    max_cached_lines: Option<usize>,
+    clock: u64,
+    stats: TextDocumentLayoutStats,
+    revisions: TextLayoutRevisions,
+    last_shape_key: Option<ShapeKey>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -174,6 +252,7 @@ struct ShapedRun {
     color: Color,
     text: String,
     layout: Arc<Buffer>,
+    shape_key: ShapeKey,
 }
 
 #[derive(Debug)]
@@ -195,12 +274,14 @@ pub struct TextSystem {
     clock: u64,
     next_run_id: u64,
     stats: GlyphCacheStats,
+    shape_calls: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TextError {
     AtlasFull,
     UnknownRun(TextRunId),
+    InvalidDirtyLineRange,
 }
 
 impl std::fmt::Display for TextError {
@@ -208,6 +289,9 @@ impl std::fmt::Display for TextError {
         match self {
             Self::AtlasFull => f.write_str("glyph atlas is full; create a larger text atlas"),
             Self::UnknownRun(id) => write!(f, "text run {} does not exist", id.0),
+            Self::InvalidDirtyLineRange => {
+                f.write_str("dirty line range does not match the document")
+            }
         }
     }
 }
@@ -251,6 +335,7 @@ impl TextSystem {
                 atlas_capacity_pixels: (size * size) as u64,
                 ..GlyphCacheStats::default()
             },
+            shape_calls: 0,
         }
     }
 
@@ -269,8 +354,16 @@ impl TextSystem {
         style: TextStyle,
         width: Option<f32>,
     ) -> Result<(), TextError> {
-        if !self.runs.contains_key(&id) {
+        let shape_key = ShapeKey::new(style, width);
+        let Some(existing) = self.runs.get(&id) else {
             return Err(TextError::UnknownRun(id));
+        };
+        if existing.text == text && existing.shape_key == shape_key {
+            if existing.color != style.color {
+                Arc::make_mut(self.runs.get_mut(&id).expect("run checked above")).color =
+                    style.color;
+            }
+            return Ok(());
         }
         let run = self.shape_run(text, style, width);
         self.runs.insert(id, Arc::new(run));
@@ -292,6 +385,7 @@ impl TextSystem {
     }
 
     fn shape_run(&mut self, text: &str, style: TextStyle, width: Option<f32>) -> ShapedRun {
+        self.shape_calls += 1;
         let metrics = Metrics::new(style.size_px, style.line_height_px.max(style.size_px));
         let mut buffer = Buffer::new(&mut self.fonts, metrics);
         buffer.set_size(width, None);
@@ -335,7 +429,18 @@ impl TextSystem {
             color: style.color,
             text: text.to_owned(),
             layout: Arc::new(buffer),
+            shape_key: ShapeKey::new(style, width),
         }
+    }
+
+    pub fn shape_call_count(&self) -> u64 {
+        self.shape_calls
+    }
+
+    fn estimated_run_bytes(&self, id: TextRunId) -> usize {
+        self.runs.get(&id).map_or(0, |run| {
+            size_of::<ShapedRun>() + run.text.len() + run.glyphs.len() * size_of::<GlyphPosition>()
+        })
     }
 
     /// Resolve a grapheme-cluster index to logical-point coordinates from the shaped layout.
@@ -760,6 +865,397 @@ impl TextSystem {
     }
 }
 
+impl TextDocumentLayout {
+    pub fn new(line_grapheme_lengths: impl IntoIterator<Item = usize>, line_height: f32) -> Self {
+        let line_height = line_height.max(1.0);
+        let lines = line_grapheme_lengths
+            .into_iter()
+            .map(|grapheme_len| CachedDocumentLine {
+                run: None,
+                revision: LayoutRevision::default(),
+                shape_key: None,
+                grapheme_len,
+                grapheme_start: 0,
+                top: 0.0,
+                height: line_height,
+                metrics: TextMetrics {
+                    size: Size::new(0.0, line_height),
+                    ..TextMetrics::default()
+                },
+                color: None,
+                last_used: 0,
+            })
+            .collect::<Vec<_>>();
+        let mut layout = Self {
+            lines,
+            max_cached_lines: None,
+            clock: 0,
+            stats: TextDocumentLayoutStats::default(),
+            revisions: TextLayoutRevisions::default(),
+            last_shape_key: None,
+        };
+        layout.rebuild_positions_from(0);
+        layout
+    }
+
+    pub fn line_count(&self) -> usize {
+        self.lines.len()
+    }
+
+    pub fn visible_line_range(&self, top: f32, height: f32) -> Range<usize> {
+        if self.lines.is_empty() || height <= 0.0 {
+            return 0..0;
+        }
+        let start = self.line_at_y(top).unwrap_or(0);
+        let end = self
+            .line_at_y(top + height)
+            .map_or(self.lines.len(), |index| index + 1);
+        start..end
+    }
+
+    pub fn revisions(&self) -> TextLayoutRevisions {
+        self.revisions
+    }
+
+    pub fn stats(&self) -> TextDocumentLayoutStats {
+        self.stats
+    }
+
+    pub fn take_stats(&mut self) -> TextDocumentLayoutStats {
+        std::mem::take(&mut self.stats)
+    }
+
+    pub fn set_max_cached_lines(&mut self, maximum: Option<usize>) {
+        self.max_cached_lines = maximum.map(|limit| limit.max(1));
+    }
+
+    /// Approximation excludes allocator metadata and cosmic-text's private buffer storage.
+    pub fn estimated_cache_bytes(&self, text: &TextSystem) -> usize {
+        self.lines.len() * size_of::<CachedDocumentLine>()
+            + self
+                .lines
+                .iter()
+                .filter_map(|line| line.run)
+                .map(|run| text.estimated_run_bytes(run))
+                .sum::<usize>()
+    }
+
+    pub fn apply_edit(
+        &mut self,
+        text: &mut TextSystem,
+        dirty: DirtyLineRange,
+        inserted_grapheme_lengths: &[usize],
+        line_height: f32,
+    ) -> Result<(), TextError> {
+        if dirty.start > self.lines.len()
+            || dirty.removed > self.lines.len() - dirty.start
+            || dirty.inserted != inserted_grapheme_lengths.len()
+        {
+            return Err(TextError::InvalidDirtyLineRange);
+        }
+        let start = dirty.start;
+        let end = start + dirty.removed;
+        for line in &self.lines[start..end] {
+            if let Some(run) = line.run {
+                text.remove_run(run);
+            }
+        }
+        let estimate = line_height.max(1.0);
+        let next_document_revision = LayoutRevision(self.revisions.document.0.wrapping_add(1));
+        let inserted = inserted_grapheme_lengths
+            .iter()
+            .map(|grapheme_len| CachedDocumentLine {
+                run: None,
+                revision: next_document_revision,
+                shape_key: None,
+                grapheme_len: *grapheme_len,
+                grapheme_start: 0,
+                top: 0.0,
+                height: estimate,
+                metrics: TextMetrics {
+                    size: Size::new(0.0, estimate),
+                    ..TextMetrics::default()
+                },
+                color: None,
+                last_used: 0,
+            })
+            .collect::<Vec<_>>();
+        self.lines.splice(start..end, inserted);
+        self.stats.lines_invalidated += dirty.removed.max(inserted_grapheme_lengths.len()) as u64;
+        self.revisions.document = next_document_revision;
+        self.rebuild_positions_from(start);
+        Ok(())
+    }
+
+    pub fn layout_visible_lines(
+        &mut self,
+        text: &mut TextSystem,
+        visible: Range<usize>,
+        overscan: usize,
+        style: TextStyle,
+        width: Option<f32>,
+        mut line_text: impl FnMut(usize) -> String,
+    ) -> Result<Vec<TextDocumentLine>, TextError> {
+        let start = visible.start.min(self.lines.len()).saturating_sub(overscan);
+        let end = visible
+            .end
+            .min(self.lines.len())
+            .saturating_add(overscan)
+            .min(self.lines.len());
+        let shape_key = ShapeKey::new(style, width);
+        let old_shape_key = self.last_shape_key;
+        if let Some(previous) = old_shape_key {
+            if previous.width != shape_key.width {
+                self.revisions.constraints.0 = self.revisions.constraints.0.wrapping_add(1);
+            } else if previous != shape_key {
+                self.revisions.style.0 = self.revisions.style.0.wrapping_add(1);
+            }
+            if previous != shape_key {
+                let estimate = style.line_height_px.max(1.0);
+                for line in &mut self.lines {
+                    line.height = estimate;
+                    line.metrics.size.height = estimate;
+                }
+                self.rebuild_positions_from(0);
+            }
+        }
+        self.last_shape_key = Some(shape_key);
+        let mut position_dirty_from = None;
+        let mut output = Vec::with_capacity(end.saturating_sub(start));
+        for index in start..end {
+            let line = &mut self.lines[index];
+            let reusable = line.run.is_some() && line.shape_key == Some(shape_key);
+            if line.run.is_some() && !reusable {
+                self.stats.lines_invalidated += 1;
+            }
+            self.clock = self.clock.wrapping_add(1).max(1);
+            line.last_used = self.clock;
+            self.stats.lines_materialized += 1;
+            if reusable {
+                let run = line.run.expect("reusable line has a shaped run");
+                if line.color != Some(style.color) {
+                    text.set_run_color(run, style.color)?;
+                    line.color = Some(style.color);
+                }
+                self.stats.cache_hits += 1;
+            } else {
+                let content = line_text(index);
+                let grapheme_len = content.graphemes(true).count();
+                if line.grapheme_len != grapheme_len {
+                    line.grapheme_len = grapheme_len;
+                    position_dirty_from =
+                        Some(position_dirty_from.map_or(index, |old: usize| old.min(index)));
+                }
+                if let Some(run) = line.run {
+                    let before = text.shape_call_count();
+                    text.update_run(run, &content, style, width)?;
+                    if text.shape_call_count() > before {
+                        self.stats.lines_shaped += 1;
+                        position_dirty_from =
+                            Some(position_dirty_from.map_or(index, |old: usize| old.min(index)));
+                    }
+                    line.color = Some(style.color);
+                } else {
+                    let run = text.shape(&content, style, width);
+                    line.run = Some(run);
+                    self.stats.lines_shaped += 1;
+                    position_dirty_from =
+                        Some(position_dirty_from.map_or(index, |old: usize| old.min(index)));
+                    line.color = Some(style.color);
+                }
+                let run = line.run.expect("line was shaped above");
+                line.metrics = text.run_metrics(run).unwrap_or_default();
+                line.height = line.metrics.size.height.max(style.line_height_px.max(1.0));
+                line.shape_key = Some(shape_key);
+            }
+            output.push(TextDocumentLine {
+                logical_index: index,
+                revision: line.revision,
+                run: line.run.expect("shaped or updated above"),
+                grapheme_start: line.grapheme_start,
+                top: line.top,
+                height: line.height,
+                metrics: line.metrics,
+            });
+        }
+        if let Some(from) = position_dirty_from {
+            self.rebuild_positions_from(from);
+            for line in &mut output {
+                line.top = self.lines[line.logical_index].top;
+                line.height = self.lines[line.logical_index].height;
+            }
+        }
+        self.evict_outside(text, start..end);
+        Ok(output)
+    }
+
+    pub fn hit_test(&self, text: &TextSystem, point: Point) -> Option<usize> {
+        let index = self.line_at_y(point.y)?;
+        let line = self.lines.get(index)?;
+        let run = line.run?;
+        let local = text.point_to_position(run, Point::new(point.x, point.y - line.top))?;
+        Some(self.grapheme_start(index) + local.min(line.grapheme_len))
+    }
+
+    pub fn position_to_point(&self, text: &TextSystem, position: usize) -> Option<Point> {
+        let (index, local) = self.line_at_position(position)?;
+        let line = &self.lines[index];
+        let run = line.run?;
+        let point = text.position_to_point(run, local)?;
+        Some(Point::new(point.x, point.y + line.top))
+    }
+
+    pub fn caret_rect(&self, text: &TextSystem, position: usize, width: f32) -> Option<Rect> {
+        let (index, local) = self.line_at_position(position)?;
+        let line = &self.lines[index];
+        let mut rect = text.caret_rect(line.run?, local, width)?;
+        rect.min.y += line.top;
+        rect.max.y += line.top;
+        Some(rect)
+    }
+
+    pub fn visual_line_boundary(
+        &self,
+        text: &TextSystem,
+        position: usize,
+        end: bool,
+    ) -> Option<usize> {
+        let (index, local) = self.line_at_position(position)?;
+        let line = &self.lines[index];
+        let run = line.run?;
+        let caret = text.position_to_point(run, local)?;
+        let visual = text
+            .line_metrics(run)?
+            .into_iter()
+            .find(|metric| caret.y >= metric.top && caret.y < metric.top + metric.height)
+            .or_else(|| text.line_metrics(run)?.last().copied())?;
+        Some(line.grapheme_start + if end { visual.end } else { visual.start })
+    }
+
+    pub fn selection_rects(&self, text: &TextSystem, start: usize, end: usize) -> Vec<Rect> {
+        self.selection_rects_in_range(text, start, end, 0..self.lines.len())
+    }
+
+    pub fn selection_rects_in_range(
+        &self,
+        text: &TextSystem,
+        start: usize,
+        end: usize,
+        line_range: Range<usize>,
+    ) -> Vec<Rect> {
+        let start = start.min(end);
+        let end = start.max(end);
+        let line_start = line_range.start.min(self.lines.len());
+        let line_end = line_range.end.min(self.lines.len()).max(line_start);
+        self.lines[line_start..line_end]
+            .iter()
+            .enumerate()
+            .filter_map(|(offset, line)| {
+                let index = line_start + offset;
+                let run = line.run?;
+                let line_start = self.grapheme_start(index);
+                let local_start = start.saturating_sub(line_start).min(line.grapheme_len);
+                let local_end = end.saturating_sub(line_start).min(line.grapheme_len);
+                if local_start >= local_end {
+                    return None;
+                }
+                Some(
+                    text.selection_rects(run, local_start, local_end)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|mut rect| {
+                            rect.min.y += line.top;
+                            rect.max.y += line.top;
+                            rect
+                        })
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .flatten()
+            .collect()
+    }
+
+    fn line_at_y(&self, y: f32) -> Option<usize> {
+        if self.lines.is_empty() {
+            return None;
+        }
+        let index = self
+            .lines
+            .partition_point(|line| line.top + line.height < y);
+        Some(index.min(self.lines.len() - 1))
+    }
+
+    fn line_at_position(&self, position: usize) -> Option<(usize, usize)> {
+        if self.lines.is_empty() {
+            return None;
+        }
+        let index = self
+            .lines
+            .partition_point(|line| line.grapheme_start <= position)
+            .saturating_sub(1);
+        Some((
+            index,
+            position
+                .saturating_sub(self.lines[index].grapheme_start)
+                .min(self.lines[index].grapheme_len),
+        ))
+    }
+
+    fn grapheme_start(&self, index: usize) -> usize {
+        self.lines.get(index).map_or(0, |line| line.grapheme_start)
+    }
+
+    fn rebuild_positions_from(&mut self, from: usize) {
+        if self.lines.is_empty() {
+            return;
+        }
+        let from = from.min(self.lines.len() - 1);
+        let mut top = if from == 0 {
+            0.0
+        } else {
+            let previous = &self.lines[from - 1];
+            previous.top + previous.height
+        };
+        let mut grapheme_start = if from == 0 {
+            0
+        } else {
+            let previous = &self.lines[from - 1];
+            previous.grapheme_start + previous.grapheme_len + 1
+        };
+        for line in &mut self.lines[from..] {
+            line.top = top;
+            line.grapheme_start = grapheme_start;
+            top += line.height;
+            grapheme_start += line.grapheme_len + 1;
+        }
+    }
+
+    fn evict_outside(&mut self, text: &mut TextSystem, active: Range<usize>) {
+        let Some(maximum) = self.max_cached_lines else {
+            return;
+        };
+        let mut cached = self.lines.iter().filter(|line| line.run.is_some()).count();
+        while cached > maximum {
+            let candidate = self
+                .lines
+                .iter()
+                .enumerate()
+                .filter(|(index, line)| line.run.is_some() && !active.contains(index))
+                .max_by_key(|(index, line)| {
+                    (active.start.abs_diff(*index), u64::MAX - line.last_used)
+                })
+                .map(|(index, _)| index);
+            let Some(index) = candidate else { break };
+            if let Some(run) = self.lines[index].run.take() {
+                text.remove_run(run);
+                self.lines[index].shape_key = None;
+                self.stats.lines_evicted += 1;
+                cached -= 1;
+            }
+        }
+    }
+}
+
 fn cursor_for_position(text: &str, position: usize) -> Cursor {
     let mut remaining = position;
     for (line, value) in text.split('\n').enumerate() {
@@ -832,6 +1328,34 @@ mod tests {
         assert_eq!(first.glyphs.len(), second.glyphs.len());
         assert_eq!(text.stats().rasterized, rasterized);
         assert!(text.stats().hits > 0);
+    }
+
+    #[test]
+    fn update_run_reuses_unchanged_shape_and_color_is_paint_only() {
+        let mut text = TextSystem::new();
+        let id = text.shape("stable", TextStyle::default(), None);
+        let before = text.shape_call_count();
+        text.update_run(id, "stable", TextStyle::default(), None)
+            .unwrap();
+        assert_eq!(text.shape_call_count(), before);
+        let recolored = TextStyle {
+            color: Color::from_srgba8(ui_core::Srgb8 {
+                r: 200,
+                g: 30,
+                b: 60,
+                a: 255,
+            }),
+            ..TextStyle::default()
+        };
+        text.update_run(id, "stable", recolored, None).unwrap();
+        assert_eq!(text.shape_call_count(), before);
+        assert!(
+            text.prepare(id, Point::ZERO, 1.0)
+                .unwrap()
+                .glyphs
+                .iter()
+                .all(|g| g.color == recolored.color)
+        );
     }
 
     #[test]
@@ -935,5 +1459,290 @@ mod tests {
         text.begin_frame();
         text.prepare(second, Point::ZERO, 1.0).unwrap();
         assert!(text.stats().evictions > evictions_during_first_frame);
+    }
+
+    #[test]
+    fn unchanged_document_frames_and_hit_testing_do_not_reshape_lines() {
+        let lines = (0..10_000).map(|i| format!("line {i}")).collect::<Vec<_>>();
+        let lengths = lines.iter().map(|line| line.graphemes(true).count());
+        let mut document = TextDocumentLayout::new(lengths, 22.0);
+        let mut text = TextSystem::new();
+        let visible = 4_999..5_049;
+        let first = document
+            .layout_visible_lines(
+                &mut text,
+                visible.clone(),
+                8,
+                TextStyle::default(),
+                None,
+                |index| lines[index].clone(),
+            )
+            .unwrap();
+        assert_eq!(first.len(), 66);
+        assert_eq!(document.stats().lines_shaped, 66);
+        let shape_count = text.shape_call_count();
+        assert!(
+            document
+                .hit_test(&text, Point::new(24.0, first[10].top + 10.0))
+                .is_some()
+        );
+        let mut source_reads = 0;
+        for _ in 0..100 {
+            document
+                .layout_visible_lines(
+                    &mut text,
+                    visible.clone(),
+                    8,
+                    TextStyle::default(),
+                    None,
+                    |index| {
+                        source_reads += 1;
+                        lines[index].clone()
+                    },
+                )
+                .unwrap();
+        }
+        assert_eq!(text.shape_call_count(), shape_count);
+        assert_eq!(source_reads, 0);
+        assert_eq!(document.stats().lines_shaped, 66);
+        assert_eq!(document.stats().cache_hits, 66 * 100);
+    }
+
+    #[test]
+    fn single_line_edit_and_newline_split_reuse_unaffected_runs() {
+        let mut lines = vec![
+            "A".to_owned(),
+            "B".to_owned(),
+            "C".to_owned(),
+            "D".to_owned(),
+        ];
+        let mut document = TextDocumentLayout::new([1, 1, 1, 1], 20.0);
+        let mut text = TextSystem::new();
+        let before = document
+            .layout_visible_lines(&mut text, 0..4, 0, TextStyle::default(), None, |i| {
+                lines[i].clone()
+            })
+            .unwrap();
+        lines[2] = "C changed".into();
+        document
+            .apply_edit(
+                &mut text,
+                DirtyLineRange {
+                    start: 2,
+                    removed: 1,
+                    inserted: 1,
+                },
+                &[9],
+                20.0,
+            )
+            .unwrap();
+        let shaped_before = text.shape_call_count();
+        let edited = document
+            .layout_visible_lines(&mut text, 0..4, 0, TextStyle::default(), None, |i| {
+                lines[i].clone()
+            })
+            .unwrap();
+        assert_eq!(text.shape_call_count() - shaped_before, 1);
+        assert_eq!(before[0].run, edited[0].run);
+        assert_eq!(before[1].run, edited[1].run);
+        assert_eq!(before[3].run, edited[3].run);
+
+        lines.splice(2..3, ["C".to_owned(), "inserted".to_owned()]);
+        document
+            .apply_edit(
+                &mut text,
+                DirtyLineRange {
+                    start: 2,
+                    removed: 1,
+                    inserted: 2,
+                },
+                &[1, 8],
+                20.0,
+            )
+            .unwrap();
+        let split = document
+            .layout_visible_lines(&mut text, 0..5, 0, TextStyle::default(), None, |i| {
+                lines[i].clone()
+            })
+            .unwrap();
+        assert_eq!(split[0].run, before[0].run);
+        assert_eq!(split[1].run, before[1].run);
+        assert_eq!(split[4].run, before[3].run);
+        assert_eq!(document.line_count(), 5);
+    }
+
+    #[test]
+    fn viewport_overscan_and_cache_eviction_limit_materialized_lines() {
+        let mut document = TextDocumentLayout::new(std::iter::repeat_n(12, 100_000), 20.0);
+        document.set_max_cached_lines(Some(64));
+        let mut text = TextSystem::new();
+        let visible = document
+            .layout_visible_lines(
+                &mut text,
+                50_000..50_050,
+                10,
+                TextStyle::default(),
+                None,
+                |i| format!("row {i}"),
+            )
+            .unwrap();
+        assert_eq!(visible.len(), 70);
+        assert_eq!(document.stats().lines_shaped, 70);
+        assert!(document.estimated_cache_bytes(&text) > 100_000 * size_of::<CachedDocumentLine>());
+        let before = text.shape_call_count();
+        document
+            .layout_visible_lines(
+                &mut text,
+                99_900..99_950,
+                10,
+                TextStyle::default(),
+                None,
+                |i| format!("row {i}"),
+            )
+            .unwrap();
+        assert_eq!(text.shape_call_count() - before, 70);
+        assert!(document.stats().lines_evicted > 0);
+        assert!(
+            document
+                .hit_test(&text, Point::new(4.0, visible[0].top + 2.0))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn scrolling_into_cached_overlap_shapes_only_newly_visible_lines() {
+        let mut document = TextDocumentLayout::new(std::iter::repeat_n(8, 100), 20.0);
+        let mut text = TextSystem::new();
+        document
+            .layout_visible_lines(&mut text, 10..20, 2, TextStyle::default(), None, |i| {
+                format!("row {i}")
+            })
+            .unwrap();
+        let before = text.shape_call_count();
+        let scrolled = document
+            .layout_visible_lines(&mut text, 15..25, 2, TextStyle::default(), None, |i| {
+                format!("row {i}")
+            })
+            .unwrap();
+        assert_eq!(scrolled.len(), 14);
+        assert_eq!(text.shape_call_count() - before, 5);
+    }
+
+    #[test]
+    fn newline_merge_and_multiline_paste_preserve_unaffected_cached_runs() {
+        let mut lines = vec![
+            "A".to_owned(),
+            "B".to_owned(),
+            "C".to_owned(),
+            "D".to_owned(),
+        ];
+        let mut document = TextDocumentLayout::new([1, 1, 1, 1], 20.0);
+        let mut text = TextSystem::new();
+        let original = document
+            .layout_visible_lines(&mut text, 0..4, 0, TextStyle::default(), None, |i| {
+                lines[i].clone()
+            })
+            .unwrap();
+
+        lines.splice(1..3, ["BC".to_owned()]);
+        document
+            .apply_edit(
+                &mut text,
+                DirtyLineRange {
+                    start: 1,
+                    removed: 2,
+                    inserted: 1,
+                },
+                &[2],
+                20.0,
+            )
+            .unwrap();
+        let before = text.shape_call_count();
+        let merged = document
+            .layout_visible_lines(&mut text, 0..3, 0, TextStyle::default(), None, |i| {
+                lines[i].clone()
+            })
+            .unwrap();
+        assert_eq!(text.shape_call_count() - before, 1);
+        assert_eq!(merged[0].run, original[0].run);
+        assert_eq!(merged[2].run, original[3].run);
+
+        lines.splice(1..2, ["x".into(), "y".into(), "z".into()]);
+        document
+            .apply_edit(
+                &mut text,
+                DirtyLineRange {
+                    start: 1,
+                    removed: 1,
+                    inserted: 3,
+                },
+                &[1, 1, 1],
+                20.0,
+            )
+            .unwrap();
+        let before = text.shape_call_count();
+        let pasted = document
+            .layout_visible_lines(&mut text, 0..5, 0, TextStyle::default(), None, |i| {
+                lines[i].clone()
+            })
+            .unwrap();
+        assert_eq!(text.shape_call_count() - before, 3);
+        assert_eq!(pasted[0].run, original[0].run);
+        assert_eq!(pasted[4].run, original[3].run);
+    }
+
+    #[test]
+    fn wrap_width_change_shapes_visible_lines_but_does_not_rasterize() {
+        let mut document = TextDocumentLayout::new([64, 64, 64], 20.0);
+        let mut text = TextSystem::new();
+        let content = "many words in a line that should wrap";
+        document
+            .layout_visible_lines(
+                &mut text,
+                0..3,
+                0,
+                TextStyle::default(),
+                Some(100.0),
+                |_| content.into(),
+            )
+            .unwrap();
+        let before = text.shape_call_count();
+        let rasterized = text.stats().rasterized;
+        document
+            .layout_visible_lines(
+                &mut text,
+                0..3,
+                0,
+                TextStyle::default(),
+                Some(200.0),
+                |_| content.into(),
+            )
+            .unwrap();
+        assert_eq!(text.shape_call_count() - before, 3);
+        assert_eq!(text.stats().rasterized, rasterized);
+        assert_eq!(document.revisions().constraints, LayoutRevision(1));
+    }
+
+    #[test]
+    fn document_layout_resolves_visual_line_boundaries_from_cached_runs() {
+        let content = "one two three four five six seven eight nine ten";
+        let mut document = TextDocumentLayout::new([content.graphemes(true).count()], 20.0);
+        let mut text = TextSystem::new();
+        let lines = document
+            .layout_visible_lines(&mut text, 0..1, 0, TextStyle::default(), Some(80.0), |_| {
+                content.into()
+            })
+            .unwrap();
+        let metrics = text.line_metrics(lines[0].run).unwrap();
+        assert!(metrics.len() > 1);
+        let current = metrics[1].start + 1;
+        assert_eq!(
+            document.visual_line_boundary(&text, current, false),
+            Some(metrics[1].start)
+        );
+        assert_eq!(
+            document.visual_line_boundary(&text, current, true),
+            Some(metrics[1].end)
+        );
     }
 }
