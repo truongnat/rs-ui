@@ -1,0 +1,15 @@
+[package]
+name = "diagnostic"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+pollster.workspace = true
+ui-core = { path = "../../crates/ui-core" }
+ui-renderer = { path = "../../crates/ui-renderer" }
+ui-text = { path = "../../crates/ui-text" }
+ui-window = { path = "../../crates/ui-window" }
+wgpu.workspace = true
+winit.workspace = true
+

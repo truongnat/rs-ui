@@ -1,0 +1,12 @@
+[package]
+name = "stress"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ui-core = { path = "../../crates/ui-core" }
+pollster.workspace = true
+ui-renderer = { path = "../../crates/ui-renderer" }
+ui-text = { path = "../../crates/ui-text" }
+wgpu.workspace = true

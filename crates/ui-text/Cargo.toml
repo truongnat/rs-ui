@@ -1,0 +1,11 @@
+[package]
+name = "ui-text"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+cosmic-text = { workspace = true, features = ["monospace_fallback"] }
+fontdb.workspace = true
+swash.workspace = true
+ui-core = { path = "../ui-core" }

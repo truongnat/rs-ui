@@ -1,0 +1,14 @@
+[package]
+name = "basic"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+pollster.workspace = true
+ui-core = { path = "../../crates/ui-core" }
+ui-renderer = { path = "../../crates/ui-renderer" }
+ui-window = { path = "../../crates/ui-window" }
+wgpu.workspace = true
+winit.workspace = true
+

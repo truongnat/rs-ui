@@ -1,0 +1,9 @@
+[package]
+name = "ui-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ui-core = { path = "../ui-core" }
+ui-text = { path = "../ui-text" }
