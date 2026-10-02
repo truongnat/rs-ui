@@ -21,6 +21,8 @@ pub enum FontFamily {
     Sans,
     Serif,
     Monospace,
+    /// A host-provided or installed font family name.
+    Named(&'static str),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -304,6 +306,17 @@ impl TextSystem {
         Self::with_atlas_size(DEFAULT_ATLAS_SIZE)
     }
 
+    /// Load host font bytes before shaping, retaining system Unicode fallbacks.
+    pub fn with_fonts(font_data: impl IntoIterator<Item = Vec<u8>>) -> Self {
+        let mut text = Self::new();
+        let (locale, mut db) = text.fonts.into_locale_and_db();
+        for bytes in font_data {
+            db.load_font_data(bytes);
+        }
+        text.fonts = FontSystem::new_with_locale_and_db(locale, db);
+        text
+    }
+
     pub fn with_atlas_size(size: u32) -> Self {
         Self::with_atlas_limits(size, MAX_ATLAS_SIZE)
     }
@@ -400,6 +413,7 @@ impl TextSystem {
             FontFamily::Sans => Family::SansSerif,
             FontFamily::Serif => Family::Serif,
             FontFamily::Monospace => Family::Monospace,
+            FontFamily::Named(name) => Family::Name(name),
         };
         let attrs = Attrs::new().family(family).weight(style.weight.cosmic());
         buffer.set_text(text, &attrs, Shaping::Advanced, None);
@@ -1424,6 +1438,56 @@ mod tests {
                 "fallback in {value:?}"
             );
         }
+    }
+
+    #[test]
+    fn host_font_bytes_can_be_selected_by_family_name() {
+        let system = TextSystem::new();
+        let id = system
+            .fonts
+            .db()
+            .query(&fontdb::Query {
+                families: &[fontdb::Family::SansSerif],
+                ..Default::default()
+            })
+            .unwrap();
+        let family = system.fonts.db().face(id).unwrap().families[0].0.clone();
+        let bytes = system
+            .fonts
+            .db()
+            .with_face_data(id, |bytes, _| bytes.to_vec())
+            .unwrap();
+        let mut text = TextSystem::with_fonts([bytes]);
+        let system_faces = text
+            .fonts
+            .db()
+            .faces()
+            .filter(|face| !matches!(face.source, fontdb::Source::Binary(_)))
+            .map(|face| face.id)
+            .collect::<Vec<_>>();
+        for face in system_faces {
+            text.fonts.db_mut().remove_face(face);
+        }
+        let family = Box::leak(family.into_boxed_str());
+        let run = text.shape(
+            "DB Pro",
+            TextStyle {
+                family: FontFamily::Named(family),
+                ..Default::default()
+            },
+            None,
+        );
+        assert!(text.runs[&run].glyphs.iter().all(|glyph| matches!(
+            text.fonts.db().face(glyph.font_id).unwrap().source,
+            fontdb::Source::Binary(_)
+        )));
+        assert!(
+            !text
+                .prepare(run, Point::ZERO, 1.0)
+                .unwrap()
+                .glyphs
+                .is_empty()
+        );
     }
 
     #[test]
