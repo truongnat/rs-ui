@@ -2,7 +2,11 @@ use std::{collections::HashMap, time::Duration};
 
 use ui_core::{Point, Rect, Transform};
 
-use crate::{DirtyFlags, NodeId, RuntimeError, UiTree};
+use crate::{
+    AccessibilityAction, AccessibilityActionKind, AccessibilityRole, AccessibilitySemantics,
+    BehaviorCommand, DirtyFlags, NodeId, PressableState, Resizable, ResizeAxis, ResizeConfig,
+    RuntimeError, UiTree,
+};
 
 const DRAG_THRESHOLD: f32 = 4.0;
 const DOUBLE_CLICK_INTERVAL: Duration = Duration::from_millis(500);
@@ -138,6 +142,7 @@ pub enum EventType {
     WindowFocus,
     WindowBlur,
     AccessibilityAction,
+    BehaviorCommand,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -155,6 +160,7 @@ pub enum EventKind {
     WindowFocus,
     WindowBlur,
     AccessibilityAction(crate::AccessibilityAction),
+    BehaviorCommand(BehaviorCommand),
 }
 
 impl EventKind {
@@ -173,6 +179,7 @@ impl EventKind {
             Self::WindowFocus => EventType::WindowFocus,
             Self::WindowBlur => EventType::WindowBlur,
             Self::AccessibilityAction(_) => EventType::AccessibilityAction,
+            Self::BehaviorCommand(_) => EventType::BehaviorCommand,
         }
     }
 }
@@ -377,6 +384,8 @@ pub(crate) struct InteractionRuntime {
     press_timestamp: Duration,
     press_cancelled: bool,
     last_click: Option<(NodeId, Duration)>,
+    pressables: HashMap<NodeId, PressableState>,
+    resizables: HashMap<NodeId, Resizable>,
 }
 
 impl InteractionRuntime {
@@ -386,6 +395,8 @@ impl InteractionRuntime {
 
     pub(crate) fn remove_node(&mut self, node: NodeId) {
         self.listeners.remove(&node);
+        self.pressables.remove(&node);
+        self.resizables.remove(&node);
         self.pointer.hovered_path.retain(|id| *id != node);
         if self.pointer.pressed_target == Some(node) {
             self.pointer.pressed_target = None;
@@ -821,6 +832,200 @@ impl UiTree {
         Ok(self.dispatch_to_target(target, event))
     }
 
+    pub fn dispatch_behavior_command(
+        &mut self,
+        root: NodeId,
+        command: BehaviorCommand,
+        elapsed: Duration,
+    ) -> Result<Event, RuntimeError> {
+        self.nodes
+            .get(&root)
+            .ok_or(RuntimeError::UnknownNode(root))?;
+        let focused = self.interaction_runtime.focus.focused;
+        let target = focused
+            .filter(|node| *node == root || self.is_descendant(*node, root))
+            .unwrap_or(root);
+        let mut event =
+            self.dispatch_to_target(target, Event::new(EventKind::BehaviorCommand(command)));
+        if event.default_prevented() {
+            return Ok(event);
+        }
+        match command {
+            BehaviorCommand::Activate => {
+                let click = self.dispatch_to_target(
+                    target,
+                    Event::new(EventKind::Click(PointerEvent {
+                        button: Some(PointerButton::Primary),
+                        click_count: 1,
+                        timestamp: elapsed,
+                        ..PointerEvent::default()
+                    })),
+                );
+                if click.default_prevented() {
+                    event.prevent_default();
+                }
+            }
+            BehaviorCommand::MoveNext => {
+                self.traverse_focus_in(root, false, None)?;
+            }
+            BehaviorCommand::MovePrevious => {
+                self.traverse_focus_in(root, true, None)?;
+            }
+            BehaviorCommand::MoveFirst => {
+                self.traverse_focus_in(root, false, Some(false))?;
+            }
+            BehaviorCommand::MoveLast => {
+                self.traverse_focus_in(root, false, Some(true))?;
+            }
+            BehaviorCommand::Increment => self.adjust_focused_resizable(1.0)?,
+            BehaviorCommand::Decrement => self.adjust_focused_resizable(-1.0)?,
+            BehaviorCommand::Cancel => self.cancel_active_resize(target),
+        }
+        Ok(event)
+    }
+
+    pub fn register_pressable(
+        &mut self,
+        node: NodeId,
+        label: Option<String>,
+        disabled: bool,
+    ) -> Result<(), RuntimeError> {
+        self.nodes
+            .get(&node)
+            .ok_or(RuntimeError::UnknownNode(node))?;
+        self.interaction_runtime
+            .pressables
+            .insert(node, PressableState { disabled });
+        let current = self.nodes[&node].focus_policy;
+        self.set_focus_policy(
+            node,
+            FocusPolicy {
+                focusable: true,
+                disabled,
+                ..current
+            },
+        )?;
+        let mut semantics = self.nodes[&node]
+            .accessibility
+            .clone()
+            .unwrap_or_else(|| AccessibilitySemantics::new(AccessibilityRole::Button));
+        if semantics.label.is_none() {
+            semantics.label = label;
+        }
+        semantics.state.disabled = Some(disabled);
+        if !semantics.actions.contains(&AccessibilityActionKind::Press) {
+            semantics.actions.push(AccessibilityActionKind::Press);
+        }
+        self.set_accessibility_semantics(node, semantics)
+            .and_then(|()| self.invalidate(node, DirtyFlags::PAINT))
+    }
+
+    pub fn register_resizable(
+        &mut self,
+        node: NodeId,
+        config: ResizeConfig,
+        initial_value: f32,
+        label: Option<String>,
+    ) -> Result<(), RuntimeError> {
+        self.nodes
+            .get(&node)
+            .ok_or(RuntimeError::UnknownNode(node))?;
+        if !config.min.is_finite()
+            || !config.max.is_finite()
+            || !config.step.is_finite()
+            || !config.reset.is_finite()
+            || !initial_value.is_finite()
+            || config.min > config.max
+            || config.step < 0.0
+            || !(config.min..=config.max).contains(&config.reset)
+        {
+            return Err(RuntimeError::InvalidResizeConfig);
+        }
+        let value = initial_value.clamp(config.min, config.max);
+        self.interaction_runtime
+            .resizables
+            .insert(node, Resizable::new(config, value, label));
+        let current = self.nodes[&node].focus_policy;
+        self.set_focus_policy(
+            node,
+            FocusPolicy {
+                focusable: true,
+                ..current
+            },
+        )?;
+        self.update_resizable_semantics(node)?;
+        Ok(())
+    }
+
+    pub fn begin_resize(&mut self, node: NodeId, pointer: Point) -> Result<(), RuntimeError> {
+        let resizable = self
+            .interaction_runtime
+            .resizables
+            .get_mut(&node)
+            .ok_or(RuntimeError::UnknownNode(node))?;
+        resizable.drag_start_pointer = Some(pointer);
+        resizable.drag_start_value = resizable.value;
+        Ok(())
+    }
+
+    pub fn update_resize(&mut self, node: NodeId, pointer: Point) -> Result<f32, RuntimeError> {
+        let resizable = self
+            .interaction_runtime
+            .resizables
+            .get_mut(&node)
+            .ok_or(RuntimeError::UnknownNode(node))?;
+        let Some(start) = resizable.drag_start_pointer else {
+            return Ok(resizable.value);
+        };
+        let delta = match resizable.config.axis {
+            ResizeAxis::Horizontal => pointer.x - start.x,
+            ResizeAxis::Vertical => pointer.y - start.y,
+        };
+        let value =
+            (resizable.drag_start_value + delta).clamp(resizable.config.min, resizable.config.max);
+        if value != resizable.value {
+            resizable.value = value;
+            self.invalidate(node, DirtyFlags::LAYOUT)?;
+            self.invalidate(node, DirtyFlags::PAINT)?;
+            self.update_resizable_semantics(node)?;
+        }
+        Ok(value)
+    }
+
+    pub fn end_resize(&mut self, node: NodeId) -> Result<(), RuntimeError> {
+        let resizable = self
+            .interaction_runtime
+            .resizables
+            .get_mut(&node)
+            .ok_or(RuntimeError::UnknownNode(node))?;
+        resizable.drag_start_pointer = None;
+        Ok(())
+    }
+
+    pub fn resizable_value(&self, node: NodeId) -> Option<f32> {
+        self.interaction_runtime
+            .resizables
+            .get(&node)
+            .map(|resizable| resizable.value)
+    }
+
+    pub fn reset_resizable(&mut self, node: NodeId) -> Result<(), RuntimeError> {
+        let resizable = self
+            .interaction_runtime
+            .resizables
+            .get_mut(&node)
+            .ok_or(RuntimeError::UnknownNode(node))?;
+        let value = resizable.config.reset;
+        resizable.drag_start_pointer = None;
+        if value != resizable.value {
+            resizable.value = value;
+            self.invalidate(node, DirtyFlags::LAYOUT)?;
+            self.invalidate(node, DirtyFlags::PAINT)?;
+            self.update_resizable_semantics(node)?;
+        }
+        Ok(())
+    }
+
     pub fn window_focus(&mut self, root: NodeId) -> Result<Event, RuntimeError> {
         self.dispatch(root, Event::new(EventKind::WindowFocus))
     }
@@ -891,8 +1096,163 @@ impl UiTree {
     }
 
     fn dispatch_to_target(&mut self, target: NodeId, mut event: Event) -> Event {
+        if matches!(event.kind, EventKind::Click(_))
+            && self
+                .interaction_runtime
+                .pressables
+                .get(&target)
+                .is_some_and(|pressable| pressable.disabled)
+        {
+            event.prevent_default();
+            return event;
+        }
+        let accessibility_action = match &event.kind {
+            EventKind::AccessibilityAction(action) => Some(action.clone()),
+            _ => None,
+        };
         self.dispatch_event_along_path(target, &mut event);
+        if !event.default_prevented() {
+            match accessibility_action {
+                Some(AccessibilityAction::Press) => {
+                    let click = self.dispatch_to_target(
+                        target,
+                        Event::new(EventKind::Click(PointerEvent {
+                            button: Some(PointerButton::Primary),
+                            click_count: 1,
+                            ..PointerEvent::default()
+                        })),
+                    );
+                    if click.default_prevented() {
+                        event.prevent_default();
+                    }
+                }
+                Some(AccessibilityAction::Increment) => {
+                    let _ = self.adjust_resizable(target, 1.0);
+                }
+                Some(AccessibilityAction::Decrement) => {
+                    let _ = self.adjust_resizable(target, -1.0);
+                }
+                _ => {}
+            }
+        }
         event
+    }
+
+    fn update_resizable_semantics(&mut self, node: NodeId) -> Result<(), RuntimeError> {
+        let resizable = self
+            .interaction_runtime
+            .resizables
+            .get(&node)
+            .ok_or(RuntimeError::UnknownNode(node))?;
+        let value = resizable.value.to_string();
+        let label = resizable.label.clone();
+        let mut semantics = self.nodes[&node]
+            .accessibility
+            .clone()
+            .unwrap_or_else(|| AccessibilitySemantics::new(AccessibilityRole::Separator));
+        if semantics.label.is_none() {
+            semantics.label = label;
+        }
+        semantics.value = Some(value);
+        for action in [
+            AccessibilityActionKind::Increment,
+            AccessibilityActionKind::Decrement,
+        ] {
+            if !semantics.actions.contains(&action) {
+                semantics.actions.push(action);
+            }
+        }
+        self.set_accessibility_semantics(node, semantics)
+    }
+
+    fn adjust_resizable(&mut self, node: NodeId, direction: f32) -> Result<(), RuntimeError> {
+        let Some(resizable) = self.interaction_runtime.resizables.get_mut(&node) else {
+            return Ok(());
+        };
+        let value = (resizable.value + direction * resizable.config.step)
+            .clamp(resizable.config.min, resizable.config.max);
+        if value == resizable.value {
+            return Ok(());
+        }
+        resizable.value = value;
+        self.invalidate(node, DirtyFlags::LAYOUT)?;
+        self.invalidate(node, DirtyFlags::PAINT)?;
+        self.update_resizable_semantics(node)
+    }
+
+    fn adjust_focused_resizable(&mut self, direction: f32) -> Result<(), RuntimeError> {
+        if let Some(focused) = self.interaction_runtime.focus.focused {
+            self.adjust_resizable(focused, direction)?;
+        }
+        Ok(())
+    }
+
+    fn cancel_active_resize(&mut self, node: NodeId) {
+        let Some(resizable) = self.interaction_runtime.resizables.get_mut(&node) else {
+            return;
+        };
+        if resizable.drag_start_pointer.is_none() {
+            return;
+        }
+        let value = resizable.drag_start_value;
+        resizable.drag_start_pointer = None;
+        if value != resizable.value {
+            resizable.value = value;
+            let _ = self.invalidate(node, DirtyFlags::LAYOUT);
+            let _ = self.invalidate(node, DirtyFlags::PAINT);
+            let _ = self.update_resizable_semantics(node);
+        }
+    }
+
+    fn traverse_focus_in(
+        &mut self,
+        root: NodeId,
+        backwards: bool,
+        first_or_last: Option<bool>,
+    ) -> Result<bool, RuntimeError> {
+        if self.interaction_runtime.focus.order_dirty {
+            self.rebuild_focus_order();
+        }
+        let trap_scope = self
+            .interaction_runtime
+            .focus
+            .scopes
+            .last()
+            .filter(|scope| scope.trap_focus)
+            .map(|scope| scope.node);
+        let order = self
+            .interaction_runtime
+            .focus
+            .traversal_order
+            .iter()
+            .copied()
+            .filter(|node| {
+                (*node == root || self.is_descendant(*node, root))
+                    && trap_scope
+                        .is_none_or(|scope| *node == scope || self.is_descendant(*node, scope))
+            })
+            .collect::<Vec<_>>();
+        if order.is_empty() {
+            return Ok(false);
+        }
+        let index = if let Some(last) = first_or_last {
+            Some(if last { order.len() - 1 } else { 0 })
+        } else {
+            let current = self.interaction_runtime.focus.focused;
+            let current_index =
+                current.and_then(|focused| order.iter().position(|node| *node == focused));
+            match (current_index, backwards) {
+                (Some(index), false) => Some((index + 1) % order.len()),
+                (Some(index), true) => Some((index + order.len() - 1) % order.len()),
+                (None, false) => Some(0),
+                (None, true) => Some(order.len() - 1),
+            }
+        };
+        if let Some(index) = index {
+            self.request_focus(order[index])
+        } else {
+            Ok(false)
+        }
     }
 
     fn dispatch_at_target(&mut self, target: NodeId, mut event: Event) {

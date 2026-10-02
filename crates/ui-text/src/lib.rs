@@ -698,11 +698,10 @@ impl TextSystem {
                 .map(|glyph| u64::from(glyph.rect[2] * glyph.rect[3]))
                 .sum(),
             free_rect_count: self.free_rects.len() as u64,
-            fragmentation_per_mille: if free_area == 0 {
-                0
-            } else {
-                (1000 * (free_area - largest_free_area) / free_area).min(1000)
-            },
+            fragmentation_per_mille: (1000 * (free_area - largest_free_area))
+                .checked_div(free_area)
+                .unwrap_or(0)
+                .min(1000),
             ..self.stats
         }
     }

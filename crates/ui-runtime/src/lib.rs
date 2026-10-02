@@ -11,13 +11,17 @@ use ui_core::{
 use ui_text::TextMetrics;
 
 mod accessibility;
+mod behavior;
 mod interaction;
 mod scroll;
+mod selection;
 mod text_editing;
 
 pub use accessibility::*;
+pub use behavior::*;
 pub use interaction::*;
 pub use scroll::*;
+pub use selection::*;
 pub use text_editing::*;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -286,6 +290,7 @@ pub enum RuntimeError {
     UnknownNode(NodeId),
     CannotParentToDescendant,
     FocusTargetOutsideScope,
+    InvalidResizeConfig,
 }
 
 impl std::fmt::Display for RuntimeError {
@@ -296,6 +301,7 @@ impl std::fmt::Display for RuntimeError {
             Self::FocusTargetOutsideScope => {
                 f.write_str("focus target is outside the active focus scope")
             }
+            Self::InvalidResizeConfig => f.write_str("invalid resize configuration"),
         }
     }
 }

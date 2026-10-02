@@ -608,6 +608,26 @@ fn build_subtree(
 }
 
 impl UiTree {
+    pub fn apply_selection_state(
+        &mut self,
+        node: NodeId,
+        selected: bool,
+    ) -> Result<(), RuntimeError> {
+        let mut semantics = self
+            .nodes
+            .get(&node)
+            .ok_or(RuntimeError::UnknownNode(node))?
+            .accessibility
+            .clone()
+            .unwrap_or_else(|| AccessibilitySemantics::new(AccessibilityRole::Group));
+        if semantics.state.selected != Some(selected) {
+            semantics.state.selected = Some(selected);
+            self.set_accessibility_semantics(node, semantics)?;
+            self.invalidate(node, crate::DirtyFlags::PAINT)?;
+        }
+        Ok(())
+    }
+
     pub fn set_accessibility_semantics(
         &mut self,
         node: NodeId,
