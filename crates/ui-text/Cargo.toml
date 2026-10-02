@@ -8,5 +8,6 @@ license.workspace = true
 cosmic-text = { workspace = true, features = ["monospace_fallback"] }
 fontdb.workspace = true
 swash.workspace = true
+sys-locale = "0.3"
 ui-core = { path = "../ui-core" }
 unicode-segmentation.workspace = true

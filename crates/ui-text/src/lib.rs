@@ -168,7 +168,7 @@ pub struct GlyphCacheStats {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct GlyphQuad {
-    /// Logical position, kept fractional through the GPU vertex stage.
+    /// Logical bitmap origin. Subpixel positioning is already baked into coverage.
     pub origin: Point,
     pub size: Size,
     /// Normalized coordinates into the single-channel glyph atlas.
@@ -238,6 +238,7 @@ struct PendingGlyph {
 #[derive(Clone, Debug)]
 struct GlyphPosition {
     origin: Point,
+    baseline: f32,
     font_id: fontdb::ID,
     glyph_id: u16,
     font_size: f32,
@@ -310,8 +311,14 @@ impl TextSystem {
     pub fn with_atlas_limits(size: u32, max_size: u32) -> Self {
         let size = size.max(64);
         let max_size = max_size.max(size);
+        // Preserve fontdb's system generic-family mapping; cosmic's defaults can
+        // name an absent font and send even ASCII spaces through emoji fallback.
+        let mut db = fontdb::Database::new();
+        db.load_system_fonts();
+        let locale = sys_locale::get_locale().unwrap_or_else(|| "en-US".to_owned());
+        let fonts = FontSystem::new_with_locale_and_db(locale, db);
         Self {
-            fonts: FontSystem::new(),
+            fonts,
             rasterizer: SwashCache::new(),
             runs: HashMap::new(),
             atlas: GlyphAtlas {
@@ -408,9 +415,10 @@ impl TextSystem {
             baseline = run.line_y;
             for glyph in run.glyphs {
                 let x = glyph.x + glyph.font_size * glyph.x_offset;
-                let y = run.line_y - glyph.font_size * glyph.y_offset;
+                let y = run.line_y + glyph.y - glyph.font_size * glyph.y_offset;
                 glyphs.push(GlyphPosition {
                     origin: Point::new(x, y),
+                    baseline: run.line_y,
                     font_id: glyph.font_id,
                     glyph_id: glyph.glyph_id,
                     font_size: glyph.font_size,
@@ -559,9 +567,11 @@ impl TextSystem {
         for glyph in &run.glyphs {
             let physical_origin = Point::new(
                 (origin.x + glyph.origin.x) * scale_factor,
-                (origin.y + glyph.origin.y) * scale_factor,
+                // Snap the line baseline, preserving shaped mark offsets and X advances.
+                ((origin.y + glyph.baseline) * scale_factor).round()
+                    + (glyph.origin.y - glyph.baseline) * scale_factor,
             );
-            let (key, _, _) = cosmic_text::CacheKey::new(
+            let (key, physical_x, physical_y) = cosmic_text::CacheKey::new(
                 glyph.font_id,
                 glyph.glyph_id,
                 glyph.font_size * scale_factor,
@@ -622,9 +632,10 @@ impl TextSystem {
             };
             let [x, y, width, height] = entry.rect;
             quads.push(GlyphQuad {
+                // Swash already applies the CacheKey's fractional bin.
                 origin: Point::new(
-                    origin.x + glyph.origin.x + entry.left as f32 / scale_factor,
-                    origin.y + glyph.origin.y - entry.top as f32 / scale_factor,
+                    (physical_x + entry.left) as f32 / scale_factor,
+                    (physical_y - entry.top) as f32 / scale_factor,
                 ),
                 size: Size::new(width as f32 / scale_factor, height as f32 / scale_factor),
                 uv_min: [
@@ -729,7 +740,7 @@ impl TextSystem {
             return Err(TextError::AtlasFull);
         }
         let (x, y) = loop {
-            if let Some(position) = self.allocate_rect(width + 1, height + 1) {
+            if let Some(position) = self.allocate_rect(width + 2, height + 2) {
                 break position;
             }
             let evictable = self
@@ -749,6 +760,14 @@ impl TextSystem {
                 self.stats.evictions += 1;
             }
         };
+        let allocation = [x, y, width + 2, height + 2];
+        // A reused allocation may contain old glyphs. Clear a full transparent
+        // gutter on all sides so Linear sampling cannot bleed into its neighbour.
+        for row in y..y + height + 2 {
+            let start = (row * self.atlas.size[0] + x) as usize;
+            self.atlas.pixels[start..start + width as usize + 2].fill(0);
+        }
+        let (x, y) = (x + 1, y + 1);
         for row in 0..height as usize {
             let source_start = row * width as usize;
             let target_start = (y as usize + row) * self.atlas.size[0] as usize + x as usize;
@@ -757,10 +776,10 @@ impl TextSystem {
                 *value = pixels.get(source_start + column).copied().unwrap_or(0);
             }
         }
-        self.dirty_regions.push([x, y, width, height]);
+        self.dirty_regions.push(allocation);
         Ok(AtlasEntry {
             rect: [x, y, width, height],
-            allocation: [x, y, width + 1, height + 1],
+            allocation,
             left,
             top,
             last_used,
@@ -1358,15 +1377,184 @@ mod tests {
     }
 
     #[test]
-    fn high_dpi_uses_scaled_glyph_rasterization_without_rounding_layout_origin() {
+    fn high_dpi_aligns_bitmaps_without_rounding_shaped_layout() {
         let mut text = TextSystem::new();
         let id = text.shape("Scale", TextStyle::default(), None);
+        let layout_before = text.position_to_point(id, 2).unwrap();
         let logical_origin = Point::new(0.25, 0.75);
         let at_one_x = text.prepare(id, logical_origin, 1.0).unwrap();
         let at_two_x = text.prepare(id, logical_origin, 2.0).unwrap();
-        assert_ne!(at_one_x.glyphs[0].origin.x.fract(), 0.0);
-        assert_ne!(at_two_x.glyphs[0].origin.x.fract(), 0.0);
+        assert_eq!(at_one_x.glyphs[0].origin.x.fract(), 0.0);
+        assert_eq!((at_two_x.glyphs[0].origin.x * 2.0).fract(), 0.0);
         assert!(text.stats().rasterized > at_one_x.glyphs.len() as u64);
+        assert_eq!(text.position_to_point(id, 2), Some(layout_before));
+    }
+
+    #[test]
+    fn welcome_ascii_uses_the_primary_sans_font_including_spaces() {
+        let mut text = TextSystem::new();
+        let primary = text
+            .fonts
+            .db()
+            .query(&fontdb::Query {
+                families: &[fontdb::Family::SansSerif],
+                weight: fontdb::Weight::MEDIUM,
+                ..fontdb::Query::default()
+            })
+            .expect("a system sans font must resolve");
+        for value in [
+            "DB Pro",
+            "Open in editor",
+            "New connection",
+            "Orders by status",
+        ] {
+            let id = text.shape(
+                value,
+                TextStyle {
+                    weight: FontWeight::Medium,
+                    ..TextStyle::default()
+                },
+                None,
+            );
+            assert!(
+                text.runs[&id]
+                    .glyphs
+                    .iter()
+                    .all(|glyph| glyph.font_id == primary),
+                "fallback in {value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn reused_atlas_allocation_has_a_transparent_gutter_on_all_sides() {
+        let mut text = TextSystem::with_atlas_size(64);
+        text.atlas.pixels.fill(255);
+        text.free_rects.push([10, 10, 12, 12]);
+        let entry = text.insert_glyph(&[120; 12], 4, 3, 0, 3, 1).unwrap();
+        assert_eq!(entry.rect, [11, 11, 4, 3]);
+        assert_eq!(text.take_dirty_regions(), [entry.allocation]);
+        for y in 10..15 {
+            for x in 10..16 {
+                let expected = if (11..15).contains(&x) && (11..14).contains(&y) {
+                    120
+                } else {
+                    0
+                };
+                assert_eq!(text.atlas.pixels[(y * 64 + x) as usize], expected);
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "prints system-dependent font and physical placement diagnostics"]
+    fn text_quality_diagnostics() {
+        let mut text = TextSystem::new();
+        for family in [FontFamily::Sans, FontFamily::Monospace] {
+            let id = text.shape(
+                "DB Pro Open in editor New connection Orders by status",
+                TextStyle {
+                    family,
+                    ..TextStyle::default()
+                },
+                None,
+            );
+            let run = Arc::clone(&text.runs[&id]);
+            let mut fonts = run
+                .glyphs
+                .iter()
+                .map(|glyph| glyph.font_id)
+                .collect::<Vec<_>>();
+            fonts.sort();
+            fonts.dedup();
+            for font in fonts {
+                let face = text.fonts.db().face(font).unwrap();
+                let source = match &face.source {
+                    fontdb::Source::File(path) | fontdb::Source::SharedFile(path, _) => {
+                        path.display().to_string()
+                    }
+                    fontdb::Source::Binary(_) => "memory".to_owned(),
+                };
+                eprintln!(
+                    "[text-quality] family={family:?} actual={:?} file={source}",
+                    face.families
+                );
+            }
+            for scale in [1.0, 1.25, 1.5, 2.0] {
+                let origin = Point::new(20.37, 40.63);
+                let prepared = text.prepare(id, origin, scale).unwrap();
+                let glyph = &run.glyphs[0];
+                let quad = prepared.glyphs[0];
+                eprintln!(
+                    "[text-quality] scale={scale} font_logical={} raster_physical={} glyph_logical={:?} glyph_physical={:?} baseline_physical={} quad_physical={:?} quad_logical={:?} size_logical={:?} framebuffer={}x{}",
+                    glyph.font_size,
+                    glyph.font_size * scale,
+                    Point::new(origin.x + glyph.origin.x, origin.y + glyph.origin.y),
+                    Point::new(
+                        (origin.x + glyph.origin.x) * scale,
+                        (origin.y + glyph.origin.y) * scale
+                    ),
+                    ((origin.y + glyph.baseline) * scale).round(),
+                    Point::new(quad.origin.x * scale, quad.origin.y * scale),
+                    quad.origin,
+                    quad.size,
+                    1280.0 * scale,
+                    800.0 * scale
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn glyph_quad_matches_swash_physical_bounds_at_fractional_origins() {
+        let mut text = TextSystem::new();
+        let id = text.shape("Ag Việt\na\u{301} g", TextStyle::default(), None);
+        let run = Arc::clone(&text.runs[&id]);
+        for scale in [1.0, 1.25, 1.5, 2.0] {
+            for origin in [Point::new(10.37, 5.63), Point::new(-2.87, -1.31)] {
+                let prepared = text.prepare(id, origin, scale).unwrap();
+                let mut quads = prepared.glyphs.iter();
+                for glyph in &run.glyphs {
+                    let (key, x, y) = cosmic_text::CacheKey::new(
+                        glyph.font_id,
+                        glyph.glyph_id,
+                        glyph.font_size * scale,
+                        (
+                            (origin.x + glyph.origin.x) * scale,
+                            ((origin.y + glyph.baseline) * scale).round()
+                                + (glyph.origin.y - glyph.baseline) * scale,
+                        ),
+                        glyph.font_weight,
+                        glyph.cache_key_flags,
+                    );
+                    let Some(image) = text.rasterizer.get_image(&mut text.fonts, key).as_ref()
+                    else {
+                        continue;
+                    };
+                    let quad = quads.next().unwrap();
+                    let placement = image.placement;
+                    assert!((quad.origin.x * scale - (x + placement.left) as f32).abs() < 0.001);
+                    assert!((quad.origin.y * scale - (y - placement.top) as f32).abs() < 0.001);
+                    // Swash can return width=1, height=0 for a space: no coverage.
+                    if placement.width == 0 || placement.height == 0 {
+                        assert_eq!(quad.size, Size::ZERO);
+                        continue;
+                    }
+                    assert!((quad.size.width * scale - placement.width as f32).abs() < 0.001);
+                    assert!((quad.size.height * scale - placement.height as f32).abs() < 0.001);
+                }
+                assert!(quads.next().is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn fractional_motion_within_a_cache_bin_does_not_shift_the_bitmap_again() {
+        let mut text = TextSystem::new();
+        let id = text.shape("DB Pro", TextStyle::default(), None);
+        let first = text.prepare(id, Point::new(20.01, 40.01), 1.0).unwrap();
+        let second = text.prepare(id, Point::new(20.02, 40.02), 1.0).unwrap();
+        assert_eq!(first.glyphs, second.glyphs);
     }
 
     #[test]

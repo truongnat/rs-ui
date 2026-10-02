@@ -17,11 +17,16 @@ const ROUND_SEGMENTS: usize = 8;
 pub struct RendererOptions {
     /// `1` disables MSAA; `4` is the default for clean primitive edges.
     pub msaa_samples: u32,
+    /// Glyph coverage sampling, independent of image filtering.
+    pub text_filter: wgpu::FilterMode,
 }
 
 impl Default for RendererOptions {
     fn default() -> Self {
-        Self { msaa_samples: 4 }
+        Self {
+            msaa_samples: 4,
+            text_filter: wgpu::FilterMode::Linear,
+        }
     }
 }
 
@@ -265,6 +270,7 @@ pub struct UiRenderer {
     text_pipeline: wgpu::RenderPipeline,
     bind_group_layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
+    text_sampler: wgpu::Sampler,
     white: ImageTexture,
     images: HashMap<ImageId, ImageTexture>,
     text_atlas: ImageTexture,
@@ -353,6 +359,15 @@ impl UiRenderer {
             mipmap_filter: wgpu::MipmapFilterMode::Nearest,
             ..Default::default()
         });
+        let text_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("ui-renderer-glyph-sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            mag_filter: options.text_filter,
+            min_filter: options.text_filter,
+            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+            ..Default::default()
+        });
         let white = create_texture(
             device,
             &bind_group_layout,
@@ -391,7 +406,7 @@ impl UiRenderer {
         let text_atlas = create_mask_texture(
             device,
             &bind_group_layout,
-            &sampler,
+            &text_sampler,
             "ui-renderer-glyph-atlas",
             1024,
         );
@@ -401,6 +416,7 @@ impl UiRenderer {
             text_pipeline,
             bind_group_layout,
             sampler,
+            text_sampler,
             white,
             images: HashMap::new(),
             text_atlas,
@@ -563,6 +579,7 @@ impl UiRenderer {
                 paint => {
                     let current_transform =
                         transforms.last().copied().unwrap_or(Transform::IDENTITY);
+                    let mut vertex_transform = current_transform;
                     let clip = clips.last().unwrap();
                     let (kind, vertices) = match paint {
                         DisplayCommand::FillRect { rect, color } => {
@@ -596,9 +613,21 @@ impl UiRenderer {
                             let Some(text_system) = text.as_deref_mut() else {
                                 continue;
                             };
+                            // Include translations in the raster key, rather than
+                            // moving an already positioned bitmap by a fractional pixel.
+                            let text_origin = if current_transform.matrix[0][0] == 1.0
+                                && current_transform.matrix[0][1] == 0.0
+                                && current_transform.matrix[1][0] == 0.0
+                                && current_transform.matrix[1][1] == 1.0
+                            {
+                                vertex_transform = Transform::IDENTITY;
+                                current_transform.transform_point(*origin)
+                            } else {
+                                *origin
+                            };
                             let prepared = match text_system.prepare(
                                 *run,
-                                *origin,
+                                text_origin,
                                 viewport.scale_factor.get(),
                             ) {
                                 Ok(prepared) => prepared,
@@ -618,7 +647,7 @@ impl UiRenderer {
                         continue;
                     }
                     let mut vertices = vertices;
-                    transform_vertices(&mut vertices, current_transform, viewport);
+                    transform_vertices(&mut vertices, vertex_transform, viewport);
                     if clip.geometry_clip {
                         vertices = clip_triangles_to_polygon(&vertices, &clip.polygon);
                     }
@@ -651,7 +680,7 @@ impl UiRenderer {
                 self.text_atlas = create_mask_texture(
                     device,
                     &self.bind_group_layout,
-                    &self.sampler,
+                    &self.text_sampler,
                     "ui-renderer-glyph-atlas",
                     atlas_size[0],
                 );
@@ -1330,5 +1359,29 @@ mod tests {
             [100, 100],
         );
         assert_eq!(clip, [15, 6, 16, 7]);
+    }
+
+    #[test]
+    fn text_vertices_map_bitmap_pixels_and_texel_centres_one_to_one() {
+        let mut text = TextSystem::new();
+        let run = text.shape("Ag", ui_text::TextStyle::default(), None);
+        for scale in [1.0, 1.25, 1.5, 2.0] {
+            let viewport = Viewport::new([2560, 1600], ScaleFactor::new(scale));
+            let prepared = text.prepare(run, Point::new(20.37, 40.63), scale).unwrap();
+            let vertices = text_vertices(&prepared, Transform::IDENTITY, viewport);
+            for (quad, vertices) in prepared.glyphs.iter().zip(vertices.chunks_exact(6)) {
+                let physical_x = (vertices[0].position[0] + 1.0) * 1280.0;
+                let physical_y = (1.0 - vertices[0].position[1]) * 800.0;
+                assert!((physical_x - quad.origin.x * scale).abs() < 0.001);
+                assert!((physical_y - quad.origin.y * scale).abs() < 0.001);
+                let width = quad.size.width * scale;
+                let u_first_pixel =
+                    quad.uv_min[0] + (quad.uv_max[0] - quad.uv_min[0]) * 0.5 / width;
+                let atlas_x = quad.uv_min[0] * text.atlas().size()[0] as f32;
+                assert!(
+                    (u_first_pixel * text.atlas().size()[0] as f32 - atlas_x - 0.5).abs() < 0.001
+                );
+            }
+        }
     }
 }

@@ -2638,6 +2638,7 @@ dependencies = [
  "cosmic-text",
  "fontdb",
  "swash",
+ "sys-locale",
  "ui-core",
  "unicode-segmentation",
 ]
