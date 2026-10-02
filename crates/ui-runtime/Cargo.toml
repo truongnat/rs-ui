@@ -16,3 +16,7 @@ harness = false
 [[bench]]
 name = "accessibility"
 harness = false
+
+[[bench]]
+name = "behavior_primitives"
+harness = false

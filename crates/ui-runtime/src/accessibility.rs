@@ -51,6 +51,8 @@ pub enum AccessibilityRole {
     Slider,
     Link,
     Image,
+    List,
+    ListItem,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -119,6 +121,7 @@ pub struct AccessibilitySemantics {
     pub state: AccessibilityState,
     pub actions: Vec<AccessibilityActionKind>,
     pub labelled_by: Vec<NodeId>,
+    pub described_by: Vec<NodeId>,
     pub hidden: bool,
     pub decorative: bool,
     pub multiline: Option<bool>,
@@ -134,6 +137,7 @@ impl AccessibilitySemantics {
             state: AccessibilityState::default(),
             actions: default_actions(role),
             labelled_by: Vec::new(),
+            described_by: Vec::new(),
             hidden: false,
             decorative: false,
             multiline: None,
@@ -160,6 +164,7 @@ pub struct AccessibilityNode {
     pub bounds: Option<Rect>,
     pub actions: Vec<AccessibilityActionKind>,
     pub children: Vec<AccessibilityId>,
+    pub described_by: Vec<AccessibilityId>,
     pub text_selection: Option<AccessibilityTextSelection>,
     pub multiline: Option<bool>,
 }
@@ -346,6 +351,40 @@ impl SemanticTree {
             }
         }
         self.nodes = after;
+        for (source, runtime_node) in &tree.nodes {
+            let Some(spec) = runtime_node.accessibility.as_ref() else {
+                continue;
+            };
+            let Some(id) = self.ids_by_node.get(source).copied() else {
+                continue;
+            };
+            let relationships = spec
+                .described_by
+                .iter()
+                .filter_map(|target| self.ids_by_node.get(target).copied())
+                .collect::<Vec<_>>();
+            if let Some(semantic) = self.nodes.get_mut(&id) {
+                semantic.described_by = relationships;
+                if semantic.description.is_none() {
+                    semantic.description = spec
+                        .described_by
+                        .iter()
+                        .filter_map(|target| {
+                            tree.nodes.get(target).and_then(|target| {
+                                target
+                                    .accessibility_text
+                                    .clone()
+                                    .or_else(|| target.accessibility.as_ref()?.label.clone())
+                            })
+                        })
+                        .reduce(|mut left, right| {
+                            left.push(' ');
+                            left.push_str(&right);
+                            left
+                        });
+                }
+            }
+        }
         self.focused = tree
             .focus_manager()
             .focused()
@@ -410,6 +449,8 @@ impl SemanticTree {
         }
         match request.action {
             AccessibilityAction::Focus => tree.request_focus(node_id),
+            AccessibilityAction::Increment => tree.adjust_resizable(node_id, 1.0),
+            AccessibilityAction::Decrement => tree.adjust_resizable(node_id, -1.0),
             AccessibilityAction::Press => {
                 tree.accessibility_press(node_id)?;
                 Ok(true)
@@ -474,13 +515,18 @@ fn build_subtree(
     let Some(node) = tree.nodes.get(&node_id) else {
         return (Vec::new(), Vec::new());
     };
-    let world = node.hit_test.transform.then(parent_world);
-    let clip = node
-        .hit_test
-        .clip
-        .map(|local| world.transform_rect(local))
-        .and_then(|local| intersect_optional(parent_clip, Some(local)))
-        .or(parent_clip);
+    let (world, clip) = if tree.portal_relationship(node_id).is_some() {
+        physical_accessibility_geometry(tree, node_id)
+    } else {
+        let world = node.hit_test.transform.then(parent_world);
+        let clip = node
+            .hit_test
+            .clip
+            .map(|local| world.transform_rect(local))
+            .and_then(|local| intersect_optional(parent_clip, Some(local)))
+            .or(parent_clip);
+        (world, clip)
+    };
     let clean = !node.dirty.contains(DirtyFlags::ACCESSIBILITY);
     if clean
         && let Some(cached) = semantics.subtrees.get(&node_id)
@@ -516,11 +562,11 @@ fn build_subtree(
     };
     let mut child_roots = Vec::new();
     let mut child_all = Vec::new();
-    for child in &node.children {
+    for child in tree.semantic_children(node_id) {
         let (roots, all) = build_subtree(
             tree,
             semantics,
-            *child,
+            child,
             child_world,
             child_clip,
             before,
@@ -566,6 +612,9 @@ fn build_subtree(
         }
         state = role_filtered_state(spec.role, state);
         let mut actions = spec.actions.clone();
+        if state.disabled == Some(true) {
+            actions.retain(|action| *action == AccessibilityActionKind::Focus);
+        }
         if state.read_only == Some(true) {
             actions.retain(|action| *action != AccessibilityActionKind::SetValue);
         }
@@ -582,6 +631,7 @@ fn build_subtree(
             bounds,
             actions,
             children: result.exposed_roots.clone(),
+            described_by: Vec::new(),
             text_selection: selection,
             multiline: (spec.role == AccessibilityRole::TextInput)
                 .then_some(spec.multiline)
@@ -607,6 +657,35 @@ fn build_subtree(
     (result.exposed_roots, result.all_ids)
 }
 
+fn physical_accessibility_geometry(tree: &UiTree, node_id: NodeId) -> (Transform, Option<Rect>) {
+    let mut path = Vec::new();
+    let mut current = Some(node_id);
+    while let Some(node) = current {
+        path.push(node);
+        current = tree.nodes.get(&node).and_then(|node| node.parent);
+    }
+    path.reverse();
+    let mut world = Transform::IDENTITY;
+    let mut clip = None;
+    for (index, id) in path.iter().copied().enumerate() {
+        if index > 0 {
+            let parent_id = path[index - 1];
+            if let Some(offset) = tree.scroll_transform(parent_id) {
+                let parent = &tree.nodes[&parent_id];
+                let viewport = world.transform_rect(parent.hit_test.bounds);
+                clip = intersect_optional(clip, Some(viewport));
+                world = Transform::translation(-offset.x, -offset.y).then(world);
+            }
+        }
+        let node = &tree.nodes[&id];
+        world = node.hit_test.transform.then(world);
+        if let Some(local_clip) = node.hit_test.clip {
+            clip = intersect_optional(clip, Some(world.transform_rect(local_clip)));
+        }
+    }
+    (world, clip)
+}
+
 impl UiTree {
     pub fn apply_selection_state(
         &mut self,
@@ -619,7 +698,7 @@ impl UiTree {
             .ok_or(RuntimeError::UnknownNode(node))?
             .accessibility
             .clone()
-            .unwrap_or_else(|| AccessibilitySemantics::new(AccessibilityRole::Group));
+            .unwrap_or_else(|| AccessibilitySemantics::new(AccessibilityRole::ListItem));
         if semantics.state.selected != Some(selected) {
             semantics.state.selected = Some(selected);
             self.set_accessibility_semantics(node, semantics)?;

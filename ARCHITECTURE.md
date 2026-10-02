@@ -142,3 +142,26 @@ Platform actions enter as `AccessibilityActionRequest` and are routed back throu
 `ui-runtime` defines `AccessibilityBackend`; `HeadlessAccessibilityBackend` is the deterministic test/mock implementation. `ui-window` owns the AccessKit 0.25 / `accesskit_winit` 0.34 adapter. Its callbacks queue actions for the UI thread, and the host calls `UiWindow::process_accessibility_event` before handling each winit event, submits semantic deltas, then drains and routes actions. AccessKit receives a synthetic native Window root; runtime semantic identities remain independent. Text input maps grapheme selection to an adapter-owned TextRun node. AccessKit-dependent types do not enter `ui-runtime`.
 
 `examples/accessibility_demo` prints the semantic tree and exercises unchanged diffs, Press routing, text selection/replacement, hidden subtree omission, and a dialog reveal using only the headless backend. `crates/ui-runtime/benches/accessibility.rs` measures initial construction, unchanged frames, a single-node state update, focus movement, and diff generation over 10,000 runtime nodes with a smaller semantic subset. Native adapter compilation and headless tests verify the bridge contract; actual screen-reader behavior still requires manual OS/accessibility-tool QA.
+
+## Phase 11 — Behavior primitives
+
+`ui-runtime::primitives` contains style-free state and geometry models. `Pressable` registers button semantics and focus policy; pointer release, `BehaviorCommand::Activate`, and accessibility Press all enter the existing Click dispatch path. Disabled state blocks activation and is reflected in accessibility. Focus-visible is derived from the most recent input modality. `FocusScope` remains owned by `FocusManager`; layers open/close scopes and restore the prior focus. Disabled ancestors remove their descendants from focus traversal.
+
+`LayerStack` orders active overlay hosts by `z_layer` and open sequence. Runtime paint and hit testing place layer hosts above ordinary siblings and order overlays consistently. Modal layers can trap focus and block outside pointer input. Outside pointer down, Escape, and focus outside enqueue one dismiss request for the topmost layer; the application handles that hook by closing the layer. Click-through is an explicit non-modal policy.
+
+A portal node is physically reparented under a layer host for paint placement. `PortalRelationship` retains its logical owner. Pointer/keyboard events bubble through that owner, focus containment considers both physical host and logical owner, and `SemanticTree` projects the portal as a child of the owner. Portal bounds continue to use physical transforms/clips. Closing the layer also hides portal descendants from paint, hit testing, and semantics.
+
+`place_popover` computes anchor-relative side/alignment/offset and then flips and shifts within a logical-point viewport; it has no style or renderer dependency. `TooltipController` accepts caller-provided time and trigger state so delays are deterministic in tests; `UiTree::tick_tooltip` can derive hover/focus triggers. Tooltip nodes are hidden from paint, hit testing, and accessibility until opened, and the trigger's `described_by` relationship is resolved through the existing semantic tree.
+
+`MenuModel<K>` keeps stable item keys, skips disabled items, supports arrow/Home/End navigation, activation, Escape, and timed typeahead. `UiTree::install_menu` adds Menu/MenuItem semantics and focus policies; `link_submenu` is the nested-menu seam. `SelectionModel<K>` stores stable keys rather than row positions, supports single/multiple/toggle/range/clear/select-all-with-policy, and can publish selected state through `UiTree::apply_selection_state`. `Resizable` clamps pointer/keyboard changes to min/max, captures pointer during drag, exposes Slider Increment/Decrement semantics, and offers a reset hook used on unprevented double-click.
+
+`BehaviorCommand` is platform-neutral and travels through the runtime event path. `ui-window::PlatformBehaviorInput` maps winit keys to Activate/Cancel/navigation/typeahead commands; primitives do not inspect platform keys. `examples/primitives_demo -- --headless-smoke` exercises the models and prints focus, layer, pointer-capture, menu and selection state. The release benchmark `crates/ui-runtime/benches/behavior_primitives.rs` covers 10k pressables, nested hit testing, popover cycles, 1k-item menu navigation, 100k stable selection keys, and resize streams.
+
+Invariants:
+
+- behavior != style; a primitive is not a component;
+- platform key mapping != primitive behavior;
+- accessibility action == the same semantic behavior path as pointer/keyboard activation;
+- paint placement follows the physical tree, while portal event and semantic ownership follow the logical owner;
+- overlay dismissal is ordered top-down and an outside pointer event dismisses at most one layer;
+- `DisplayList` remains ephemeral and the renderer has no primitive knowledge.

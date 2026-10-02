@@ -13,6 +13,7 @@ members = [
     "examples/interaction_bench",
     "examples/text_editing_demo",
     "examples/accessibility_demo",
+    "examples/primitives_demo",
 ]
 
 [workspace.package]

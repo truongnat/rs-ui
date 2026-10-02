@@ -1,5 +1,7 @@
 use ui_core::Point;
 
+use crate::{AccessibilityActionKind, AccessibilityRole, AccessibilitySemantics};
+
 /// Host-independent commands for common focused-control behavior.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum BehaviorCommand {
@@ -9,8 +11,13 @@ pub enum BehaviorCommand {
     MovePrevious,
     MoveFirst,
     MoveLast,
+    MoveLeft,
+    MoveRight,
+    MoveUp,
+    MoveDown,
     Increment,
     Decrement,
+    Character(char),
 }
 
 /// State registered for a node that can be activated.
@@ -19,7 +26,22 @@ pub struct Pressable {
     pub disabled: bool,
 }
 
-pub type PressableState = Pressable;
+impl Pressable {
+    pub const fn new(disabled: bool) -> Self {
+        Self { disabled }
+    }
+
+    pub const fn disabled(self) -> bool {
+        self.disabled
+    }
+
+    pub fn semantics(&self) -> AccessibilitySemantics {
+        let mut semantics = AccessibilitySemantics::new(AccessibilityRole::Button);
+        semantics.actions = vec![AccessibilityActionKind::Press];
+        semantics.state.disabled = Some(self.disabled);
+        semantics
+    }
+}
 
 /// Axis used to convert a pointer delta into a resize delta.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -57,6 +79,30 @@ impl Resizable {
             drag_start_pointer: None,
             drag_start_value: value,
         }
+    }
+
+    pub(crate) fn keyboard(&mut self, command: BehaviorCommand) -> bool {
+        let step = self.config.step;
+        let next = match (self.config.axis, command) {
+            (ResizeAxis::Horizontal, BehaviorCommand::MoveRight)
+            | (ResizeAxis::Vertical, BehaviorCommand::MoveDown)
+            | (_, BehaviorCommand::MoveNext)
+            | (_, BehaviorCommand::Increment)
+            | (_, BehaviorCommand::Activate) => self.value + step,
+            (ResizeAxis::Horizontal, BehaviorCommand::MoveLeft)
+            | (ResizeAxis::Vertical, BehaviorCommand::MoveUp)
+            | (_, BehaviorCommand::MovePrevious)
+            | (_, BehaviorCommand::Decrement) => self.value - step,
+            (_, BehaviorCommand::MoveFirst) => self.config.min,
+            (_, BehaviorCommand::MoveLast) => self.config.max,
+            _ => return false,
+        };
+        let value = next.clamp(self.config.min, self.config.max);
+        if value == self.value {
+            return false;
+        }
+        self.value = value;
+        true
     }
 }
 

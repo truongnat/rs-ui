@@ -64,6 +64,74 @@ pub enum PlatformTextCommand {
     CancelComposition,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PlatformBehaviorInput {
+    pub command: Option<ui_runtime::BehaviorCommand>,
+    pub repeat: bool,
+}
+
+impl PlatformBehaviorInput {
+    /// Normalize navigation and activation keys without giving runtime primitives winit key types.
+    pub fn from_winit(
+        event: &winit::event::KeyEvent,
+        modifiers: winit::keyboard::ModifiersState,
+    ) -> Self {
+        let command = map_behavior_command(
+            &event.logical_key,
+            event.text.as_deref(),
+            event.state,
+            event.repeat,
+            modifiers,
+        );
+        Self {
+            command,
+            repeat: event.repeat,
+        }
+    }
+}
+
+fn map_behavior_command(
+    key: &winit::keyboard::Key,
+    text: Option<&str>,
+    state: winit::event::ElementState,
+    repeat: bool,
+    modifiers: winit::keyboard::ModifiersState,
+) -> Option<ui_runtime::BehaviorCommand> {
+    use ui_runtime::BehaviorCommand as Command;
+    use winit::keyboard::{Key, NamedKey};
+
+    let pressed = state == winit::event::ElementState::Pressed;
+    match key {
+        Key::Named(NamedKey::Escape) if pressed => Some(Command::Cancel),
+        Key::Named(NamedKey::Tab) if pressed => Some(if modifiers.shift_key() {
+            Command::MovePrevious
+        } else {
+            Command::MoveNext
+        }),
+        Key::Named(NamedKey::ArrowDown) if pressed => Some(Command::MoveDown),
+        Key::Named(NamedKey::ArrowUp) if pressed => Some(Command::MoveUp),
+        Key::Named(NamedKey::ArrowLeft) if pressed => Some(Command::MoveLeft),
+        Key::Named(NamedKey::ArrowRight) if pressed => Some(Command::MoveRight),
+        Key::Named(NamedKey::Home) if pressed => Some(Command::MoveFirst),
+        Key::Named(NamedKey::End) if pressed => Some(Command::MoveLast),
+        Key::Named(NamedKey::Enter | NamedKey::Space) if pressed && !repeat => {
+            Some(Command::Activate)
+        }
+        Key::Character(_)
+            if pressed
+                && !repeat
+                && !modifiers.control_key()
+                && !modifiers.super_key()
+                && !modifiers.alt_key() =>
+        {
+            text.and_then(|text| text.chars().next())
+                .filter(|character| !character.is_control())
+                .map(Command::Character)
+        }
+        _ => None,
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PlatformTextInput {
     pub command: Option<PlatformTextCommand>,
@@ -304,6 +372,68 @@ impl UiWindow {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ui_runtime::BehaviorCommand;
+
+    #[test]
+    fn behavior_key_mapping_normalizes_activation_navigation_and_typeahead() {
+        use winit::{
+            event::ElementState,
+            keyboard::{Key, ModifiersState, NamedKey},
+        };
+
+        let pressed = ElementState::Pressed;
+        assert_eq!(
+            map_behavior_command(
+                &Key::Named(NamedKey::Enter),
+                None,
+                pressed,
+                false,
+                ModifiersState::empty(),
+            ),
+            Some(BehaviorCommand::Activate)
+        );
+        assert_eq!(
+            map_behavior_command(
+                &Key::Named(NamedKey::Space),
+                None,
+                pressed,
+                true,
+                ModifiersState::empty(),
+            ),
+            None
+        );
+        assert_eq!(
+            map_behavior_command(
+                &Key::Named(NamedKey::Tab),
+                None,
+                pressed,
+                false,
+                ModifiersState::SHIFT,
+            ),
+            Some(BehaviorCommand::MovePrevious)
+        );
+        assert_eq!(
+            map_behavior_command(
+                &Key::Character("é".into()),
+                Some("é"),
+                pressed,
+                false,
+                ModifiersState::empty(),
+            ),
+            Some(BehaviorCommand::Character('é'))
+        );
+        assert_eq!(
+            map_behavior_command(
+                &Key::Character("x".into()),
+                Some("x"),
+                pressed,
+                false,
+                ModifiersState::CONTROL,
+            ),
+            None
+        );
+    }
+
     #[test]
     fn ime_preedit_byte_offsets_become_grapheme_offsets() {
         let event = PlatformImeEvent::from(winit::event::Ime::Preedit(

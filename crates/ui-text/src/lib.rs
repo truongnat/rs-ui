@@ -25,11 +25,55 @@ pub enum FontFamily {
     Named(&'static str),
 }
 
+impl FontFamily {
+    /// Picks a platform UI family without coupling callers to font names.
+    pub const fn system_ui() -> Self {
+        #[cfg(target_os = "macos")]
+        {
+            Self::Named("System Font")
+        }
+        #[cfg(target_os = "windows")]
+        {
+            Self::Named("Segoe UI")
+        }
+        #[cfg(target_os = "linux")]
+        {
+            Self::Named("Noto Sans")
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+        {
+            Self::Sans
+        }
+    }
+
+    /// Picks a platform monospace family without coupling callers to font names.
+    pub const fn system_monospace() -> Self {
+        #[cfg(target_os = "macos")]
+        {
+            Self::Named(".SF NS Mono")
+        }
+        #[cfg(target_os = "windows")]
+        {
+            Self::Named("Cascadia Mono")
+        }
+        #[cfg(target_os = "linux")]
+        {
+            Self::Named("Noto Sans Mono")
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+        {
+            Self::Monospace
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FontWeight {
     Regular,
     Medium,
     Bold,
+    /// Requests a CSS-like numeric weight through fontdb's 1-1000 scale.
+    Numeric(u16),
 }
 
 impl FontWeight {
@@ -38,6 +82,7 @@ impl FontWeight {
             Self::Regular => Weight::NORMAL,
             Self::Medium => Weight::MEDIUM,
             Self::Bold => Weight::BOLD,
+            Self::Numeric(weight) => Weight(weight),
         }
     }
 }
@@ -328,6 +373,13 @@ impl TextSystem {
         // name an absent font and send even ASCII spaces through emoji fallback.
         let mut db = fontdb::Database::new();
         db.load_system_fonts();
+        // A named platform face keeps Sans/Monospace stable as weight changes.
+        if let FontFamily::Named(name) = FontFamily::system_ui() {
+            db.set_sans_serif_family(name);
+        }
+        if let FontFamily::Named(name) = FontFamily::system_monospace() {
+            db.set_monospace_family(name);
+        }
         let locale = sys_locale::get_locale().unwrap_or_else(|| "en-US".to_owned());
         let fonts = FontSystem::new_with_locale_and_db(locale, db);
         Self {
@@ -1567,6 +1619,638 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    #[ignore = "prints resolved faces for font family and numeric weight audit"]
+    fn font_family_weight_diagnostics() {
+        let mut text = TextSystem::new();
+        let font_directory =
+            std::env::var_os("RS_UI_TYPOGRAPHY_FONT_DIR").map(std::path::PathBuf::from);
+        if let Some(directory) = &font_directory {
+            for file in ["Inter.ttf", "NotoSans.ttf"] {
+                let path = directory.join(file);
+                if path.exists() {
+                    text.fonts
+                        .db_mut()
+                        .load_font_data(std::fs::read(&path).expect("read audit font"));
+                }
+            }
+        }
+
+        let sample =
+            "Sample E-Commerce (SQLite) main Tables Views Triggers Xe Lạc Hồng (PostgreSQL)";
+        let families = [
+            FontFamily::Sans,
+            FontFamily::Named("Inter"),
+            FontFamily::Named("Noto Sans"),
+            FontFamily::Named("System Font"),
+            FontFamily::Monospace,
+            FontFamily::system_monospace(),
+        ];
+        let weights = [
+            FontWeight::Regular,
+            FontWeight::Numeric(450),
+            FontWeight::Medium,
+            FontWeight::Numeric(550),
+            FontWeight::Numeric(600),
+        ];
+
+        for family in families {
+            for weight in weights {
+                let id = text.shape(
+                    sample,
+                    TextStyle {
+                        family,
+                        weight,
+                        size_px: 13.0,
+                        line_height_px: 18.0,
+                        ..TextStyle::default()
+                    },
+                    None,
+                );
+                let run = &text.runs[&id];
+                let mut used = Vec::new();
+                for glyph in &run.glyphs {
+                    if !used.contains(&glyph.font_id) {
+                        used.push(glyph.font_id);
+                    }
+                }
+                let chain = used
+                    .iter()
+                    .filter_map(|font_id| {
+                        let face = text.fonts.db().face(*font_id)?;
+                        let path = match &face.source {
+                            fontdb::Source::File(path) | fontdb::Source::SharedFile(path, _) => {
+                                path.display().to_string()
+                            }
+                            fontdb::Source::Binary(_) => {
+                                let filename = face.families.first().map_or("font", |(name, _)| {
+                                    if name == "Inter" {
+                                        "Inter.ttf"
+                                    } else if name == "Noto Sans" {
+                                        "NotoSans.ttf"
+                                    } else {
+                                        "font"
+                                    }
+                                });
+                                font_directory.as_ref().map_or_else(
+                                    || "memory".to_owned(),
+                                    |directory| directory.join(filename).display().to_string(),
+                                )
+                            }
+                        };
+                        let glyph_weight = run
+                            .glyphs
+                            .iter()
+                            .find(|glyph| glyph.font_id == *font_id)
+                            .map_or(0, |glyph| glyph.font_weight.0);
+                        Some(format!(
+                            "{} face_style={:?} face_weight={} glyph_weight={} file={}",
+                            face.families.first().map_or("<unnamed>", |(name, _)| name),
+                            face.style,
+                            face.weight.0,
+                            glyph_weight,
+                            path
+                        ))
+                    })
+                    .collect::<Vec<_>>();
+                let requested_weight = match weight {
+                    FontWeight::Regular => 400,
+                    FontWeight::Medium => 500,
+                    FontWeight::Bold => 700,
+                    FontWeight::Numeric(value) => value,
+                };
+                eprintln!(
+                    "[font-audit] requested_family={family:?} requested_weight={requested_weight} resolved_chain=[{}]",
+                    chain.join(" -> ")
+                );
+                text.remove_run(id);
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "writes 1x, 1.5x and 2x CPU previews for the small-font family matrix"]
+    fn typography_matrix_artifacts() {
+        let font_dir = std::path::PathBuf::from(
+            std::env::var_os("RS_UI_TYPOGRAPHY_FONT_DIR").expect("set audit font directory"),
+        );
+        let output_dir = std::path::PathBuf::from(
+            std::env::var_os("RS_UI_TYPOGRAPHY_OUTPUT_DIR")
+                .unwrap_or_else(|| "target/typography-matrix".into()),
+        );
+        std::fs::create_dir_all(&output_dir).expect("create output directory");
+
+        let columns = [
+            (
+                "Current / Arial",
+                FontFamily::Named("Arial"),
+                FontWeight::Regular,
+            ),
+            ("Inter 400", FontFamily::Named("Inter"), FontWeight::Regular),
+            ("Inter 500", FontFamily::Named("Inter"), FontWeight::Medium),
+            (
+                "Noto Sans 400",
+                FontFamily::Named("Noto Sans"),
+                FontWeight::Regular,
+            ),
+            (
+                "Noto Sans 500",
+                FontFamily::Named("Noto Sans"),
+                FontWeight::Medium,
+            ),
+            (
+                "System UI 400",
+                FontFamily::Named("System Font"),
+                FontWeight::Regular,
+            ),
+            (
+                "System UI 500",
+                FontFamily::Named("System Font"),
+                FontWeight::Medium,
+            ),
+        ];
+        let scale_cases = [("1x", 1.0f32), ("1_5x", 1.5), ("2x", 2.0)];
+
+        for (scale_name, scale) in scale_cases {
+            let mut canvas = TypographyCanvas::new(2350, 500, scale);
+            let mut performance = Vec::new();
+            for (column_index, (label, family, weight)) in columns.iter().copied().enumerate() {
+                let mut text = TextSystem::new();
+                for file in ["Inter.ttf", "NotoSans.ttf"] {
+                    let path = font_dir.join(file);
+                    text.fonts
+                        .db_mut()
+                        .load_font_data(std::fs::read(&path).expect("read comparison font"));
+                }
+                let required_families = ["Inter", "Noto Sans"];
+                for required in required_families {
+                    assert!(
+                        text.fonts
+                            .db()
+                            .faces()
+                            .any(|face| { face.families.iter().any(|(name, _)| name == required) }),
+                        "comparison font {required} was not loaded"
+                    );
+                }
+
+                let x = 80.0 + column_index as f32 * 322.0;
+                draw_audit_label(
+                    &mut canvas,
+                    &mut text,
+                    label,
+                    TextStyle {
+                        family,
+                        weight: FontWeight::Medium,
+                        size_px: 13.0,
+                        line_height_px: 18.0,
+                        color: Color::from_srgba8(ui_core::Srgb8 {
+                            r: 55,
+                            g: 65,
+                            b: 81,
+                            a: 255,
+                        }),
+                    },
+                    x,
+                    6.0,
+                    scale,
+                );
+
+                for (row, size) in [12.0, 13.0, 14.0].into_iter().enumerate() {
+                    draw_tree_cell(
+                        &mut canvas,
+                        &mut text,
+                        family,
+                        weight,
+                        size,
+                        x,
+                        30.0 + row as f32 * 152.0,
+                        scale,
+                    );
+                }
+                let first_prepare = canvas.take_prepare_time();
+                let before_repeat = text.stats();
+                text.begin_frame();
+                for (row, size) in [12.0, 13.0, 14.0].into_iter().enumerate() {
+                    draw_tree_cell(
+                        &mut canvas,
+                        &mut text,
+                        family,
+                        weight,
+                        size,
+                        x,
+                        30.0 + row as f32 * 152.0,
+                        scale,
+                    );
+                }
+                let repeat_prepare = canvas.take_prepare_time();
+                let stats = text.stats();
+                let repeat_hits = stats.hits - before_repeat.hits;
+                let repeat_misses = stats.misses - before_repeat.misses;
+                let repeat_requests = repeat_hits + repeat_misses;
+                let repeat_hit_rate = if repeat_requests == 0 {
+                    0.0
+                } else {
+                    repeat_hits as f64 / repeat_requests as f64 * 100.0
+                };
+                let requests = stats.hits + stats.misses;
+                let hit_rate = if requests == 0 {
+                    0.0
+                } else {
+                    stats.hits as f64 / requests as f64 * 100.0
+                };
+                performance.push(format!(
+                    "{label}: first_prepare={:.3}ms repeat_prepare={:.3}ms cold_rasterized={} total_hits={} total_misses={} total_hit_rate={hit_rate:.1}% warm_hits={repeat_hits} warm_misses={repeat_misses} warm_hit_rate={repeat_hit_rate:.1}% rasterized={} evictions={} atlas={}x{} generation={} used_pixels={}",
+                    first_prepare.as_secs_f64() * 1000.0,
+                    repeat_prepare.as_secs_f64() * 1000.0,
+                    before_repeat.rasterized,
+                    stats.hits,
+                    stats.misses,
+                    stats.rasterized,
+                    stats.evictions,
+                    text.atlas().size()[0],
+                    text.atlas().size()[1],
+                    text.atlas().generation(),
+                    stats.atlas_used_pixels
+                ));
+            }
+            let (width, height) = (canvas.width, canvas.height);
+            let pixels = canvas.into_rgb();
+            let path = output_dir.join(format!("sidebar-typography-{scale_name}.ppm"));
+            write_ppm(&path, width, height, &pixels);
+            eprintln!(
+                "[typography-matrix] scale={scale_name} file={}",
+                path.display()
+            );
+            for line in performance {
+                eprintln!("[typography-perf] scale={scale_name} {line}");
+            }
+
+            let mut selected_canvas = TypographyCanvas::new(1040, 180, scale);
+            let selected_families = [
+                ("Current / Arial", FontFamily::Named("Arial")),
+                ("Inter", FontFamily::Named("Inter")),
+                ("Noto Sans", FontFamily::Named("Noto Sans")),
+                ("System UI", FontFamily::Named("System Font")),
+            ];
+            for (column, weight) in [500u16, 550, 600].into_iter().enumerate() {
+                draw_audit_label(
+                    &mut selected_canvas,
+                    &mut TextSystem::new(),
+                    &format!("Selected {weight}"),
+                    TextStyle {
+                        size_px: 12.0,
+                        line_height_px: 16.0,
+                        color: Color::from_srgba8(ui_core::Srgb8 {
+                            r: 55,
+                            g: 65,
+                            b: 81,
+                            a: 255,
+                        }),
+                        ..TextStyle::default()
+                    },
+                    260.0 + column as f32 * 250.0,
+                    6.0,
+                    scale,
+                );
+            }
+            for (row, (label, family)) in selected_families.into_iter().enumerate() {
+                let mut text = TextSystem::new();
+                for file in ["Inter.ttf", "NotoSans.ttf"] {
+                    text.fonts
+                        .db_mut()
+                        .load_font_data(std::fs::read(font_dir.join(file)).expect("read font"));
+                }
+                let y = 30.0 + row as f32 * 36.0;
+                draw_audit_label(
+                    &mut selected_canvas,
+                    &mut text,
+                    label,
+                    TextStyle {
+                        family,
+                        size_px: 12.0,
+                        line_height_px: 16.0,
+                        color: Color::from_srgba8(ui_core::Srgb8 {
+                            r: 55,
+                            g: 65,
+                            b: 81,
+                            a: 255,
+                        }),
+                        ..TextStyle::default()
+                    },
+                    16.0,
+                    y + 3.0,
+                    scale,
+                );
+                for (column, weight) in [500u16, 550, 600].into_iter().enumerate() {
+                    let x = 260.0 + column as f32 * 250.0;
+                    selected_canvas.fill_rect(x, y, 220.0, 25.0, [220, 239, 255]);
+                    let style = TextStyle {
+                        family,
+                        weight: FontWeight::Numeric(weight),
+                        size_px: 13.0,
+                        line_height_px: 18.0,
+                        color: Color::from_srgba8(ui_core::Srgb8 {
+                            r: 0,
+                            g: 100,
+                            b: 179,
+                            a: 255,
+                        }),
+                    };
+                    draw_audit_label(
+                        &mut selected_canvas,
+                        &mut text,
+                        "Views",
+                        style,
+                        x + 8.0,
+                        y + 3.0,
+                        scale,
+                    );
+                    draw_right_count(
+                        &mut selected_canvas,
+                        &mut text,
+                        "1",
+                        style,
+                        x,
+                        y + 3.0,
+                        220.0,
+                        scale,
+                    );
+                }
+            }
+            let (width, height) = (selected_canvas.width, selected_canvas.height);
+            let pixels = selected_canvas.into_rgb();
+            let path = output_dir.join(format!("selected-weight-{scale_name}.ppm"));
+            write_ppm(&path, width, height, &pixels);
+            eprintln!("[typography-matrix] selected_weights={}", path.display());
+        }
+    }
+
+    struct TypographyCanvas {
+        width: u32,
+        height: u32,
+        scale: f32,
+        pixels: Vec<u8>,
+        prepare_time: std::time::Duration,
+    }
+
+    impl TypographyCanvas {
+        fn new(width: u32, height: u32, scale: f32) -> Self {
+            let physical_width = (width as f32 * scale).round() as u32;
+            let physical_height = (height as f32 * scale).round() as u32;
+            Self {
+                width: physical_width,
+                height: physical_height,
+                scale,
+                pixels: vec![255; (physical_width * physical_height * 3) as usize],
+                prepare_time: std::time::Duration::ZERO,
+            }
+        }
+
+        fn take_prepare_time(&mut self) -> std::time::Duration {
+            std::mem::take(&mut self.prepare_time)
+        }
+
+        fn fill_rect(&mut self, x: f32, y: f32, width: f32, height: f32, color: [u8; 3]) {
+            let left = (x * self.scale).floor().max(0.0) as u32;
+            let top = (y * self.scale).floor().max(0.0) as u32;
+            let right = ((x + width) * self.scale).ceil().min(self.width as f32) as u32;
+            let bottom = ((y + height) * self.scale).ceil().min(self.height as f32) as u32;
+            for py in top..bottom {
+                for px in left..right {
+                    let offset = ((py * self.width + px) * 3) as usize;
+                    self.pixels[offset..offset + 3].copy_from_slice(&color);
+                }
+            }
+        }
+
+        fn draw_text(&mut self, text: &mut TextSystem, run: TextRunId, x: f32, y: f32) {
+            let started = std::time::Instant::now();
+            let prepared = text.prepare(run, Point::new(x, y), self.scale).unwrap();
+            self.prepare_time += started.elapsed();
+            let atlas = text.atlas();
+            let atlas_size = atlas.size();
+            let atlas_pixels = atlas.pixels();
+            for glyph in prepared.glyphs {
+                if glyph.size.width <= 0.0 || glyph.size.height <= 0.0 {
+                    continue;
+                }
+                let left = (glyph.origin.x * self.scale).floor() as i32;
+                let top = (glyph.origin.y * self.scale).floor() as i32;
+                let right = ((glyph.origin.x + glyph.size.width) * self.scale).ceil() as i32;
+                let bottom = ((glyph.origin.y + glyph.size.height) * self.scale).ceil() as i32;
+                for py in top.max(0)..bottom.min(self.height as i32) {
+                    for px in left.max(0)..right.min(self.width as i32) {
+                        let fx =
+                            ((px as f32 + 0.5) / self.scale - glyph.origin.x) / glyph.size.width;
+                        let fy =
+                            ((py as f32 + 0.5) / self.scale - glyph.origin.y) / glyph.size.height;
+                        let u = glyph.uv_min[0] + fx * (glyph.uv_max[0] - glyph.uv_min[0]);
+                        let v = glyph.uv_min[1] + fy * (glyph.uv_max[1] - glyph.uv_min[1]);
+                        let coverage = sample_linear_coverage(
+                            atlas_pixels,
+                            atlas_size[0],
+                            atlas_size[1],
+                            u,
+                            v,
+                        );
+                        let color = glyph.color.linear_rgba();
+                        let alpha = coverage * color.a;
+                        let offset = ((py as u32 * self.width + px as u32) * 3) as usize;
+                        for (channel, source) in [color.r, color.g, color.b].into_iter().enumerate()
+                        {
+                            let destination =
+                                srgb_to_linear(self.pixels[offset + channel] as f32 / 255.0);
+                            let linear = source.mul_add(alpha, destination * (1.0 - alpha));
+                            self.pixels[offset + channel] =
+                                (linear_to_srgb(linear) * 255.0 + 0.5) as u8;
+                        }
+                    }
+                }
+            }
+            text.remove_run(run);
+        }
+
+        fn into_rgb(self) -> Vec<u8> {
+            self.pixels
+        }
+    }
+
+    fn draw_audit_label(
+        canvas: &mut TypographyCanvas,
+        text: &mut TextSystem,
+        value: &str,
+        style: TextStyle,
+        x: f32,
+        y: f32,
+        _scale: f32,
+    ) {
+        let id = text.shape(value, style, None);
+        canvas.draw_text(text, id, x, y);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn draw_tree_cell(
+        canvas: &mut TypographyCanvas,
+        text: &mut TextSystem,
+        family: FontFamily,
+        weight: FontWeight,
+        size: f32,
+        x: f32,
+        y: f32,
+        scale: f32,
+    ) {
+        let width = 310.0;
+        let height = 148.0;
+        canvas.fill_rect(x, y, width, height, [250, 251, 253]);
+        let base = |color: [u8; 3], text_weight| TextStyle {
+            family,
+            weight: text_weight,
+            size_px: size,
+            line_height_px: size + 5.0,
+            color: Color::from_srgba8(ui_core::Srgb8 {
+                r: color[0],
+                g: color[1],
+                b: color[2],
+                a: 255,
+            }),
+        };
+        draw_audit_label(
+            canvas,
+            text,
+            "Sample E-Commerce (SQLite)",
+            base([38, 43, 51], weight),
+            x + 10.0,
+            y + 5.0,
+            scale,
+        );
+        draw_audit_label(
+            canvas,
+            text,
+            "main",
+            base([53, 63, 75], weight),
+            x + 20.0,
+            y + 27.0,
+            scale,
+        );
+        draw_audit_label(
+            canvas,
+            text,
+            "Tables",
+            base([45, 52, 62], weight),
+            x + 38.0,
+            y + 49.0,
+            scale,
+        );
+        draw_right_count(
+            canvas,
+            text,
+            "5",
+            base([112, 120, 132], weight),
+            x,
+            y + 49.0,
+            width,
+            scale,
+        );
+        canvas.fill_rect(x + 28.0, y + 68.0, width - 38.0, 21.0, [220, 239, 255]);
+        let selected = base([0, 100, 179], FontWeight::Numeric(550));
+        draw_audit_label(canvas, text, "Views", selected, x + 38.0, y + 71.0, scale);
+        draw_right_count(canvas, text, "1", selected, x, y + 71.0, width, scale);
+        draw_audit_label(
+            canvas,
+            text,
+            "Triggers",
+            base([147, 153, 162], weight),
+            x + 38.0,
+            y + 93.0,
+            scale,
+        );
+        draw_right_count(
+            canvas,
+            text,
+            "1",
+            base([147, 153, 162], weight),
+            x,
+            y + 93.0,
+            width,
+            scale,
+        );
+        draw_audit_label(
+            canvas,
+            text,
+            "Xe Lạc Hồng (PostgreSQL)",
+            base([93, 102, 114], weight),
+            x + 10.0,
+            y + 116.0,
+            scale,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn draw_right_count(
+        canvas: &mut TypographyCanvas,
+        text: &mut TextSystem,
+        value: &str,
+        style: TextStyle,
+        x: f32,
+        y: f32,
+        width: f32,
+        scale: f32,
+    ) {
+        let metrics = text.measure(value, style, None);
+        draw_audit_label(
+            canvas,
+            text,
+            value,
+            style,
+            x + width - metrics.size.width - 12.0,
+            y,
+            scale,
+        );
+    }
+
+    fn sample_linear_coverage(pixels: &[u8], width: u32, height: u32, u: f32, v: f32) -> f32 {
+        let x = u * width as f32 - 0.5;
+        let y = v * height as f32 - 0.5;
+        let x0 = x.floor() as i32;
+        let y0 = y.floor() as i32;
+        let tx = x - x.floor();
+        let ty = y - y.floor();
+        let sample = |sx: i32, sy: i32| {
+            if sx < 0 || sy < 0 || sx >= width as i32 || sy >= height as i32 {
+                0.0
+            } else {
+                pixels[(sy as u32 * width + sx as u32) as usize] as f32 / 255.0
+            }
+        };
+        let top = sample(x0, y0).mul_add(1.0 - tx, sample(x0 + 1, y0) * tx);
+        let bottom = sample(x0, y0 + 1).mul_add(1.0 - tx, sample(x0 + 1, y0 + 1) * tx);
+        top.mul_add(1.0 - ty, bottom * ty)
+    }
+
+    fn srgb_to_linear(value: f32) -> f32 {
+        if value <= 0.04045 {
+            value / 12.92
+        } else {
+            ((value + 0.055) / 1.055).powf(2.4)
+        }
+    }
+
+    fn linear_to_srgb(value: f32) -> f32 {
+        if value <= 0.0031308 {
+            value * 12.92
+        } else {
+            1.055 * value.powf(1.0 / 2.4) - 0.055
+        }
+    }
+
+    fn write_ppm(path: &std::path::Path, width: u32, height: u32, pixels: &[u8]) {
+        use std::io::Write;
+        let file = std::fs::File::create(path).expect("create PPM artifact");
+        let mut writer = std::io::BufWriter::new(file);
+        write!(writer, "P6\n{width} {height}\n255\n").expect("write PPM header");
+        writer.write_all(pixels).expect("write PPM pixels");
     }
 
     #[test]

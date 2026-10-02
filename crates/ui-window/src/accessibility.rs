@@ -372,6 +372,8 @@ fn native_role(role: AccessibilityRole, multiline: Option<bool>) -> NativeRole {
         AccessibilityRole::Slider => NativeRole::Slider,
         AccessibilityRole::Link => NativeRole::Link,
         AccessibilityRole::Image => NativeRole::Image,
+        AccessibilityRole::List => NativeRole::List,
+        AccessibilityRole::ListItem => NativeRole::ListItem,
     }
 }
 
@@ -467,6 +469,7 @@ mod tests {
             )),
             actions: vec![AccessibilityActionKind::Press],
             children: Vec::new(),
+            described_by: Vec::new(),
             text_selection: None,
             multiline: None,
         }

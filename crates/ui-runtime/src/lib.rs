@@ -13,6 +13,7 @@ use ui_text::TextMetrics;
 mod accessibility;
 mod behavior;
 mod interaction;
+mod primitives;
 mod scroll;
 mod selection;
 mod text_editing;
@@ -20,6 +21,7 @@ mod text_editing;
 pub use accessibility::*;
 pub use behavior::*;
 pub use interaction::*;
+pub use primitives::*;
 pub use scroll::*;
 pub use selection::*;
 pub use text_editing::*;
@@ -840,10 +842,20 @@ impl UiTree {
         let Some(node) = self.nodes.get(&id) else {
             return;
         };
+        if !node.hit_test.visible {
+            return;
+        }
         let rect = translate_rect(node.cache.rect, scroll);
         let paint = node.paint;
         let text = node.text;
-        let children = node.children.clone();
+        let mut children = node.children.clone();
+        let layers = self.layer_stack();
+        children.sort_by_key(|child| {
+            layers
+                .layer_for_node(*child)
+                .map(|entry| (1_u8, entry.spec.z_layer, entry.id.get()))
+                .unwrap_or((0, 0, child.get()))
+        });
         if let Some(color) = paint.background {
             builder.fill_rounded_rect(rect, paint.radius, color);
         }

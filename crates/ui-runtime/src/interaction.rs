@@ -1,11 +1,16 @@
-use std::{collections::HashMap, time::Duration};
+use std::{
+    collections::{HashMap, VecDeque},
+    time::Duration,
+};
 
 use ui_core::{Point, Rect, Transform};
 
 use crate::{
     AccessibilityAction, AccessibilityActionKind, AccessibilityRole, AccessibilitySemantics,
-    BehaviorCommand, DirtyFlags, NodeId, PressableState, Resizable, ResizeAxis, ResizeConfig,
-    RuntimeError, UiTree,
+    BehaviorCommand, DirtyFlags, LayerDismissRequest, LayerId, LayerSpec, LayerStack, MenuModel,
+    MenuOutcome, NodeId, PopoverConfig, PopoverPlacement, PortalRelationship, Pressable,
+    PressableState, Resizable, ResizeAxis, ResizeConfig, RuntimeError, TooltipController,
+    TooltipDelays, TooltipTriggers, UiTree, place_popover,
 };
 
 const DRAG_THRESHOLD: f32 = 4.0;
@@ -303,6 +308,13 @@ pub struct PointerState {
     pub dragging: bool,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum InputModality {
+    Pointer,
+    #[default]
+    Keyboard,
+}
+
 #[derive(Clone, Debug)]
 pub struct FocusScope {
     node: NodeId,
@@ -385,7 +397,14 @@ pub(crate) struct InteractionRuntime {
     press_cancelled: bool,
     last_click: Option<(NodeId, Duration)>,
     pressables: HashMap<NodeId, PressableState>,
+    input_modality: InputModality,
+    layers: LayerStack,
+    portals: HashMap<NodeId, PortalRelationship>,
+    dismiss_requests: VecDeque<LayerDismissRequest>,
+    submenu_links: HashMap<NodeId, NodeId>,
+    submenu_parent: HashMap<NodeId, NodeId>,
     resizables: HashMap<NodeId, Resizable>,
+    tooltips: HashMap<NodeId, TooltipController>,
 }
 
 impl InteractionRuntime {
@@ -413,15 +432,43 @@ impl InteractionRuntime {
         }
         self.focus.traversal_order.retain(|id| *id != node);
         self.focus.scopes.retain(|scope| scope.node != node);
+        self.portals
+            .retain(|portal, relation| *portal != node && relation.logical_owner != node);
+        let removed_layers = self
+            .layers
+            .entries()
+            .iter()
+            .filter(|entry| entry.spec.node == node || entry.spec.focus_scope == Some(node))
+            .map(|entry| entry.id)
+            .collect::<Vec<_>>();
+        for layer in removed_layers {
+            self.layers.close(layer);
+        }
+        self.dismiss_requests.retain(|request| request.node != node);
+        self.submenu_links
+            .retain(|parent, submenu| *parent != node && *submenu != node);
+        self.submenu_parent
+            .retain(|menu, item| *menu != node && *item != node);
+        self.resizables.remove(&node);
+        self.tooltips.remove(&node);
         self.focus.order_dirty = true;
     }
 }
 
 impl UiTree {
     pub(crate) fn accessibility_press(&mut self, node: NodeId) -> Result<(), RuntimeError> {
-        self.nodes
+        let target = self
+            .nodes
             .get(&node)
             .ok_or(RuntimeError::UnknownNode(node))?;
+        if self.pressable_is_disabled(node)
+            || target
+                .accessibility
+                .as_ref()
+                .is_some_and(|semantics| semantics.state.disabled == Some(true))
+        {
+            return Ok(());
+        }
         self.dispatch_to_target(
             node,
             Event::new(EventKind::Click(PointerEvent {
@@ -443,6 +490,603 @@ impl UiTree {
             .ok_or(RuntimeError::UnknownNode(node))?;
         self.dispatch_to_target(node, Event::new(EventKind::AccessibilityAction(action)));
         Ok(())
+    }
+
+    pub fn layer_stack(&self) -> &LayerStack {
+        &self.interaction_runtime.layers
+    }
+
+    pub fn take_layer_dismiss_requests(&mut self) -> Vec<LayerDismissRequest> {
+        self.interaction_runtime
+            .dismiss_requests
+            .drain(..)
+            .collect()
+    }
+
+    pub fn open_layer(&mut self, spec: LayerSpec) -> Result<LayerId, RuntimeError> {
+        self.nodes
+            .get(&spec.node)
+            .ok_or(RuntimeError::UnknownNode(spec.node))?;
+        if let Some(scope) = spec.focus_scope {
+            self.nodes
+                .get(&scope)
+                .ok_or(RuntimeError::UnknownNode(scope))?;
+        }
+        if let Some(initial) = spec.initial_focus {
+            self.nodes
+                .get(&initial)
+                .ok_or(RuntimeError::UnknownNode(initial))?;
+            let scope = spec.focus_scope.unwrap_or(spec.node);
+            if !self.is_descendant(initial, scope) {
+                return Err(RuntimeError::FocusTargetOutsideScope);
+            }
+        }
+        let id = self.interaction_runtime.layers.open(spec);
+        if let Some(node) = self.nodes.get_mut(&spec.node) {
+            node.hit_test.visible = true;
+            node.dirty.insert(DirtyFlags::HIT_TEST);
+            node.dirty.insert(DirtyFlags::PAINT);
+        }
+        if let Some(scope) = spec
+            .focus_scope
+            .or((spec.modal || spec.trap_focus).then_some(spec.node))
+        {
+            self.rebuild_focus_order();
+            self.push_focus_scope(
+                scope,
+                spec.modal || spec.trap_focus,
+                true,
+                spec.initial_focus,
+            )?;
+        }
+        self.set_portal_layer_visibility(id, true);
+        if let Some(semantics) = self
+            .nodes
+            .get_mut(&spec.node)
+            .and_then(|node| node.accessibility.as_mut())
+        {
+            semantics.hidden = false;
+        }
+        self.invalidate_accessibility_subtree(spec.node);
+        self.invalidate_accessibility_chain(spec.node);
+        Ok(id)
+    }
+
+    pub fn close_layer(&mut self, id: LayerId) -> Result<bool, RuntimeError> {
+        let Some(entry) = self.interaction_runtime.layers.close(id) else {
+            return Ok(false);
+        };
+        if let Some(scope) = entry
+            .spec
+            .focus_scope
+            .or((entry.spec.modal || entry.spec.trap_focus).then_some(entry.spec.node))
+        {
+            self.pop_focus_scope(scope)?;
+        }
+        if let Some(semantics) = self
+            .nodes
+            .get_mut(&entry.spec.node)
+            .and_then(|node| node.accessibility.as_mut())
+        {
+            semantics.hidden = true;
+        }
+        if let Some(node) = self.nodes.get_mut(&entry.spec.node) {
+            node.hit_test.visible = false;
+            node.dirty.insert(DirtyFlags::HIT_TEST);
+            node.dirty.insert(DirtyFlags::PAINT);
+        }
+        self.set_portal_layer_visibility(id, false);
+        if let Some(menu) = self.state.get_mut::<MenuModel<NodeId>>(entry.spec.node) {
+            menu.close();
+        }
+        self.invalidate_accessibility_subtree(entry.spec.node);
+        self.invalidate_accessibility_chain(entry.spec.node);
+        Ok(true)
+    }
+
+    pub fn register_portal(
+        &mut self,
+        node: NodeId,
+        logical_owner: NodeId,
+        layer: LayerId,
+    ) -> Result<(), RuntimeError> {
+        self.nodes
+            .get(&node)
+            .ok_or(RuntimeError::UnknownNode(node))?;
+        self.nodes
+            .get(&logical_owner)
+            .ok_or(RuntimeError::UnknownNode(logical_owner))?;
+        if self.interaction_runtime.layers.get(layer).is_none() {
+            return Err(RuntimeError::UnknownNode(node));
+        }
+        if node == logical_owner || self.is_descendant(logical_owner, node) {
+            return Err(RuntimeError::CannotParentToDescendant);
+        }
+        let host = self
+            .interaction_runtime
+            .layers
+            .get(layer)
+            .unwrap()
+            .spec
+            .node;
+        if host == node || self.is_descendant(host, node) {
+            return Err(RuntimeError::CannotParentToDescendant);
+        }
+        if self.nodes.get(&node).and_then(|node| node.parent) != Some(host) {
+            self.reparent(node, Some(host))?;
+        }
+        self.interaction_runtime.portals.insert(
+            node,
+            PortalRelationship {
+                logical_owner,
+                layer,
+            },
+        );
+        self.invalidate_accessibility_subtree(node);
+        self.invalidate_accessibility_chain(logical_owner);
+        Ok(())
+    }
+
+    pub fn portal_relationship(&self, node: NodeId) -> Option<PortalRelationship> {
+        self.interaction_runtime.portals.get(&node).copied()
+    }
+
+    fn set_portal_layer_visibility(&mut self, layer: LayerId, visible: bool) {
+        let portals = self
+            .interaction_runtime
+            .portals
+            .iter()
+            .filter_map(|(node, relationship)| (relationship.layer == layer).then_some(*node))
+            .collect::<Vec<_>>();
+        for portal in portals {
+            if let Some(node) = self.nodes.get_mut(&portal) {
+                node.hit_test.visible = visible;
+                node.dirty.insert(DirtyFlags::HIT_TEST);
+                node.dirty.insert(DirtyFlags::PAINT);
+            }
+            self.invalidate_accessibility_subtree(portal);
+            self.invalidate_accessibility_chain(portal);
+        }
+    }
+
+    pub(crate) fn semantic_children(&self, node: NodeId) -> Vec<NodeId> {
+        let mut children = self.nodes.get(&node).map_or_else(Vec::new, |n| {
+            n.children
+                .iter()
+                .copied()
+                .filter(|child| {
+                    self.interaction_runtime
+                        .portals
+                        .get(child)
+                        .is_none_or(|portal| portal.logical_owner == node)
+                })
+                .collect()
+        });
+        let portal_children = self
+            .interaction_runtime
+            .portals
+            .iter()
+            .filter_map(|(portal, relation)| {
+                (relation.logical_owner == node && !children.contains(portal)).then_some(*portal)
+            })
+            .collect::<Vec<_>>();
+        children.extend(portal_children);
+        children
+    }
+
+    pub fn install_menu(
+        &mut self,
+        root: NodeId,
+        items: Vec<(NodeId, String, bool)>,
+        typeahead_timeout: Duration,
+    ) -> Result<(), RuntimeError> {
+        self.nodes
+            .get(&root)
+            .ok_or(RuntimeError::UnknownNode(root))?;
+        let model_items = items
+            .iter()
+            .map(|(node, label, disabled)| {
+                self.nodes
+                    .get(node)
+                    .ok_or(RuntimeError::UnknownNode(*node))?;
+                Ok(crate::MenuItem {
+                    key: *node,
+                    label: label.clone(),
+                    disabled: *disabled,
+                })
+            })
+            .collect::<Result<Vec<_>, RuntimeError>>()?;
+        self.state
+            .insert(root, MenuModel::new(model_items, typeahead_timeout));
+        let mut root_semantics = AccessibilitySemantics::new(AccessibilityRole::Menu);
+        root_semantics.state.expanded = Some(false);
+        self.set_accessibility_semantics(root, root_semantics)?;
+        for (node, label, disabled) in items {
+            self.set_focus_policy(
+                node,
+                FocusPolicy {
+                    focusable: true,
+                    disabled,
+                    ..FocusPolicy::default()
+                },
+            )?;
+            let mut semantics = AccessibilitySemantics::new(AccessibilityRole::MenuItem);
+            semantics.label = Some(label);
+            semantics.actions = vec![
+                AccessibilityActionKind::Press,
+                AccessibilityActionKind::Focus,
+            ];
+            semantics.state.disabled = Some(disabled);
+            self.set_accessibility_semantics(node, semantics)?;
+        }
+        Ok(())
+    }
+
+    pub fn menu_command(
+        &mut self,
+        root: NodeId,
+        command: BehaviorCommand,
+        now: Duration,
+    ) -> Result<MenuOutcome<NodeId>, RuntimeError> {
+        let outcome = self
+            .state
+            .get_mut::<MenuModel<NodeId>>(root)
+            .ok_or(RuntimeError::UnknownNode(root))?
+            .command(command, now);
+        match outcome {
+            MenuOutcome::Moved(Some(index)) => {
+                if let Some(target) = self
+                    .state
+                    .get::<MenuModel<NodeId>>(root)
+                    .and_then(|menu| menu.active_key().copied())
+                {
+                    let _ = self.request_focus(target)?;
+                }
+                let _ = index;
+            }
+            MenuOutcome::Activate(target) => {
+                self.accessibility_press(target)?;
+                self.state
+                    .get_mut::<MenuModel<NodeId>>(root)
+                    .expect("menu remains registered")
+                    .close();
+                if let Some(semantics) = self
+                    .nodes
+                    .get_mut(&root)
+                    .and_then(|node| node.accessibility.as_mut())
+                {
+                    semantics.state.expanded = Some(false);
+                }
+                self.invalidate_accessibility_chain(root);
+            }
+            MenuOutcome::Close => {
+                if let Some(semantics) = self
+                    .nodes
+                    .get_mut(&root)
+                    .and_then(|node| node.accessibility.as_mut())
+                {
+                    semantics.state.expanded = Some(false);
+                }
+                self.invalidate_accessibility_chain(root);
+            }
+            MenuOutcome::Ignored | MenuOutcome::Moved(None) => {}
+        }
+        Ok(outcome)
+    }
+
+    pub fn open_menu(&mut self, root: NodeId) -> Result<(), RuntimeError> {
+        self.state
+            .get_mut::<MenuModel<NodeId>>(root)
+            .ok_or(RuntimeError::UnknownNode(root))?
+            .open();
+        if let Some(semantics) = self
+            .nodes
+            .get_mut(&root)
+            .and_then(|node| node.accessibility.as_mut())
+        {
+            semantics.state.expanded = Some(true);
+        }
+        if let Some(target) = self
+            .state
+            .get::<MenuModel<NodeId>>(root)
+            .and_then(|menu| menu.active_key().copied())
+        {
+            let _ = self.request_focus(target)?;
+        }
+        self.invalidate_accessibility_chain(root);
+        Ok(())
+    }
+
+    pub fn link_submenu(
+        &mut self,
+        parent_item: NodeId,
+        submenu_root: NodeId,
+    ) -> Result<(), RuntimeError> {
+        self.nodes
+            .get(&parent_item)
+            .ok_or(RuntimeError::UnknownNode(parent_item))?;
+        self.state
+            .get::<MenuModel<NodeId>>(submenu_root)
+            .ok_or(RuntimeError::UnknownNode(submenu_root))?;
+        self.interaction_runtime
+            .submenu_links
+            .insert(parent_item, submenu_root);
+        self.interaction_runtime
+            .submenu_parent
+            .insert(submenu_root, parent_item);
+        Ok(())
+    }
+
+    pub fn resize_command(
+        &mut self,
+        node: NodeId,
+        command: BehaviorCommand,
+    ) -> Result<bool, RuntimeError> {
+        let Some(resizable) = self.interaction_runtime.resizables.get_mut(&node) else {
+            return Err(RuntimeError::UnknownNode(node));
+        };
+        let changed = resizable.keyboard(command);
+        if changed {
+            self.invalidate_resizable(node)?;
+        }
+        Ok(changed)
+    }
+
+    fn invalidate_resizable(&mut self, node: NodeId) -> Result<(), RuntimeError> {
+        self.invalidate(node, DirtyFlags::PAINT)?;
+        let value = self
+            .interaction_runtime
+            .resizables
+            .get(&node)
+            .map(|resizable| resizable.value.to_string());
+        if let Some(semantics) = self
+            .nodes
+            .get_mut(&node)
+            .and_then(|node| node.accessibility.as_mut())
+        {
+            semantics.value = value;
+        }
+        self.invalidate_accessibility_node(node);
+        Ok(())
+    }
+
+    pub fn register_tooltip(
+        &mut self,
+        trigger: NodeId,
+        tooltip: NodeId,
+        delays: TooltipDelays,
+        text: impl Into<String>,
+    ) -> Result<(), RuntimeError> {
+        self.nodes
+            .get(&trigger)
+            .ok_or(RuntimeError::UnknownNode(trigger))?;
+        self.nodes
+            .get(&tooltip)
+            .ok_or(RuntimeError::UnknownNode(tooltip))?;
+        self.interaction_runtime
+            .tooltips
+            .insert(trigger, TooltipController::new(delays));
+        self.set_accessibility_text_content(tooltip, text)?;
+        let mut tooltip_semantics = AccessibilitySemantics::new(AccessibilityRole::Tooltip);
+        tooltip_semantics.hidden = true;
+        self.set_accessibility_semantics(tooltip, tooltip_semantics)?;
+        if let Some(node) = self.nodes.get_mut(&tooltip) {
+            node.hit_test.visible = false;
+            node.dirty.insert(DirtyFlags::HIT_TEST);
+            node.dirty.insert(DirtyFlags::PAINT);
+        }
+        let mut trigger_semantics = self.nodes[&trigger]
+            .accessibility
+            .clone()
+            .unwrap_or_else(|| AccessibilitySemantics::new(AccessibilityRole::Button));
+        trigger_semantics.described_by.push(tooltip);
+        self.set_accessibility_semantics(trigger, trigger_semantics)
+    }
+
+    pub fn update_tooltip(
+        &mut self,
+        trigger: NodeId,
+        now: Duration,
+        triggers: TooltipTriggers,
+    ) -> Result<bool, RuntimeError> {
+        let Some(controller) = self.interaction_runtime.tooltips.get_mut(&trigger) else {
+            return Err(RuntimeError::UnknownNode(trigger));
+        };
+        let open = controller.update(now, triggers);
+        let tooltip = self
+            .nodes
+            .get(&trigger)
+            .and_then(|node| node.accessibility.as_ref())
+            .and_then(|semantics| semantics.described_by.first().copied())
+            .ok_or(RuntimeError::UnknownNode(trigger))?;
+        let mut semantics = self.nodes[&tooltip]
+            .accessibility
+            .clone()
+            .ok_or(RuntimeError::UnknownNode(tooltip))?;
+        if semantics.hidden == open {
+            semantics.hidden = !open;
+            self.set_accessibility_semantics(tooltip, semantics)?;
+            if let Some(node) = self.nodes.get_mut(&tooltip) {
+                node.hit_test.visible = open;
+                node.dirty.insert(DirtyFlags::HIT_TEST);
+                node.dirty.insert(DirtyFlags::PAINT);
+            }
+        }
+        Ok(open)
+    }
+
+    pub fn tick_tooltip(&mut self, trigger: NodeId, now: Duration) -> Result<bool, RuntimeError> {
+        let tooltip = self
+            .nodes
+            .get(&trigger)
+            .ok_or(RuntimeError::UnknownNode(trigger))?
+            .accessibility
+            .as_ref()
+            .and_then(|semantics| semantics.described_by.first().copied())
+            .ok_or(RuntimeError::UnknownNode(trigger))?;
+        let trigger_node = &self.nodes[&trigger];
+        let tooltip_node = self
+            .nodes
+            .get(&tooltip)
+            .ok_or(RuntimeError::UnknownNode(tooltip))?;
+        let triggers = TooltipTriggers {
+            pointer_over_trigger: trigger_node.interaction.hovered,
+            pointer_over_tooltip: tooltip_node.interaction.hovered,
+            trigger_focused: self.focus_manager().focused() == Some(trigger),
+        };
+        self.update_tooltip(trigger, now, triggers)
+    }
+
+    pub fn position_popover(
+        &self,
+        anchor: NodeId,
+        size: (f32, f32),
+        viewport: Rect,
+        config: PopoverConfig,
+    ) -> Result<PopoverPlacement, RuntimeError> {
+        let bounds = self.world_bounds(anchor)?;
+        Ok(place_popover(bounds, size, viewport, config))
+    }
+
+    pub fn world_bounds(&self, node: NodeId) -> Result<Rect, RuntimeError> {
+        let mut path = Vec::new();
+        let mut current = Some(node);
+        while let Some(id) = current {
+            let target = self.nodes.get(&id).ok_or(RuntimeError::UnknownNode(id))?;
+            path.push(id);
+            current = target.parent;
+        }
+        path.reverse();
+        let mut world = Transform::IDENTITY;
+        for (index, id) in path.iter().copied().enumerate() {
+            if index > 0
+                && let Some(offset) = self.scroll_transform(path[index - 1])
+            {
+                world = Transform::translation(-offset.x, -offset.y).then(world);
+            }
+            world = self.nodes[&id].hit_test.transform.then(world);
+        }
+        let target = &self.nodes[&node];
+        Ok(world.transform_rect(target.hit_test.bounds))
+    }
+
+    pub fn dispatch_behavior_command(
+        &mut self,
+        root: NodeId,
+        command: BehaviorCommand,
+        timestamp: Duration,
+    ) -> Result<Event, RuntimeError> {
+        self.nodes
+            .get(&root)
+            .ok_or(RuntimeError::UnknownNode(root))?;
+        self.interaction_runtime.input_modality = InputModality::Keyboard;
+        let target = self
+            .interaction_runtime
+            .focus
+            .focused
+            .filter(|node| *node == root || self.is_descendant(*node, root))
+            .unwrap_or(root);
+        let mut event =
+            self.dispatch_to_target(target, Event::new(EventKind::BehaviorCommand(command)));
+        if event.default_prevented() {
+            return Ok(event);
+        }
+        if command == BehaviorCommand::Cancel
+            && let Some(request) = self.interaction_runtime.layers.escape()
+        {
+            self.interaction_runtime.dismiss_requests.push_back(request);
+            event.prevent_default();
+            return Ok(event);
+        }
+        let menu_root = self
+            .path_to_root(target)
+            .into_iter()
+            .rev()
+            .find(|node| self.state.get::<MenuModel<NodeId>>(*node).is_some());
+        if let Some(menu_root) = menu_root {
+            if command == BehaviorCommand::MoveRight
+                && let Some(submenu) = self.interaction_runtime.submenu_links.get(&target).copied()
+            {
+                self.open_menu(submenu)?;
+                return Ok(event);
+            }
+            if command == BehaviorCommand::MoveLeft
+                && let Some(parent_item) = self
+                    .interaction_runtime
+                    .submenu_parent
+                    .get(&menu_root)
+                    .copied()
+            {
+                self.menu_command(menu_root, BehaviorCommand::Cancel, timestamp)?;
+                let _ = self.request_focus(parent_item)?;
+                return Ok(event);
+            }
+            let _ = self.menu_command(menu_root, command, timestamp)?;
+            return Ok(event);
+        }
+        match command {
+            BehaviorCommand::Activate => {
+                if self.interaction_runtime.resizables.contains_key(&target) {
+                    let _ = self.resize_command(target, command)?;
+                    event.prevent_default();
+                } else if self
+                    .state
+                    .get::<Pressable>(target)
+                    .is_some_and(|pressable| !pressable.disabled())
+                {
+                    self.accessibility_press(target)?;
+                    event.prevent_default();
+                }
+            }
+            BehaviorCommand::MoveNext => {
+                if self.interaction_runtime.resizables.contains_key(&target) {
+                    let _ = self.resize_command(target, command)?;
+                } else {
+                    let _ = self.traverse_focus(false)?;
+                }
+            }
+            BehaviorCommand::MovePrevious => {
+                if self.interaction_runtime.resizables.contains_key(&target) {
+                    let _ = self.resize_command(target, command)?;
+                } else {
+                    let _ = self.traverse_focus_in(root, true, None)?;
+                }
+            }
+            BehaviorCommand::MoveFirst | BehaviorCommand::MoveLast
+                if self.interaction_runtime.resizables.contains_key(&target) =>
+            {
+                let _ = self.resize_command(target, command)?;
+            }
+            BehaviorCommand::MoveFirst => {
+                self.traverse_focus_in(root, false, Some(false))?;
+            }
+            BehaviorCommand::MoveLast => {
+                self.traverse_focus_in(root, false, Some(true))?;
+            }
+            BehaviorCommand::MoveLeft
+            | BehaviorCommand::MoveRight
+            | BehaviorCommand::MoveUp
+            | BehaviorCommand::MoveDown
+                if self.interaction_runtime.resizables.contains_key(&target) =>
+            {
+                let _ = self.resize_command(target, command)?;
+            }
+            BehaviorCommand::Increment => {
+                let _ = self.adjust_resizable(target, 1.0)?;
+            }
+            BehaviorCommand::Decrement => {
+                let _ = self.adjust_resizable(target, -1.0)?;
+            }
+            BehaviorCommand::Cancel => self.cancel_active_resize(target),
+            BehaviorCommand::MoveRight => {
+                if let Some(submenu) = self.interaction_runtime.submenu_links.get(&target).copied()
+                {
+                    self.open_menu(submenu)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(event)
     }
 
     pub fn set_hit_test_state(
@@ -525,7 +1169,13 @@ impl UiTree {
             world_transform
         };
         let mut children = target.children.clone();
-        children.sort_by_key(|child| self.nodes[child].hit_test.z_order);
+        children.sort_by_key(|child| {
+            self.interaction_runtime
+                .layers
+                .layer_for_node(*child)
+                .map(|entry| (1_u8, entry.spec.z_layer, entry.id.get()))
+                .unwrap_or((0, self.nodes[child].hit_test.z_order, child.get()))
+        });
         for child in children.into_iter().rev() {
             if let Some(mut path) = self.hit_test_node(child, position, child_transform) {
                 path.insert(0, node);
@@ -567,6 +1217,7 @@ impl UiTree {
         root: NodeId,
         pointer: PointerEvent,
     ) -> Result<(), RuntimeError> {
+        self.interaction_runtime.input_modality = InputModality::Pointer;
         self.update_hover_path(root, pointer.position, pointer)?;
         if let Some(start) = self.interaction_runtime.press_position
             && distance(start, pointer.position) > DRAG_THRESHOLD
@@ -586,6 +1237,9 @@ impl UiTree {
                     .copied()
             });
         if let Some(target) = target {
+            if self.interaction_runtime.resizables.contains_key(&target) {
+                let _ = self.update_resize(target, pointer.position)?;
+            }
             self.dispatch_to_target(target, Event::new(EventKind::PointerMove(pointer)));
         }
         Ok(())
@@ -596,6 +1250,29 @@ impl UiTree {
         root: NodeId,
         pointer: PointerEvent,
     ) -> Result<(), RuntimeError> {
+        self.interaction_runtime.input_modality = InputModality::Pointer;
+        let captured = self.interaction_runtime.pointer.captured_target;
+        let candidate = self.hit_test(root, pointer.position)?.last().copied();
+        let candidate_inside_top = self
+            .interaction_runtime
+            .layers
+            .topmost()
+            .is_some_and(|entry| {
+                candidate.is_some_and(|target| self.is_descendant(target, entry.spec.node))
+            });
+        let outside = if captured.is_some() {
+            crate::OutsidePointerResult::default()
+        } else {
+            self.interaction_runtime
+                .layers
+                .outside_pointer_down(candidate, |_, _| candidate_inside_top)
+        };
+        if let Some(request) = outside.dismissed {
+            self.interaction_runtime.dismiss_requests.push_back(request);
+        }
+        if outside.blocked {
+            return Ok(());
+        }
         self.update_hover_path(root, pointer.position, pointer)?;
         let target = self
             .interaction_runtime
@@ -614,7 +1291,11 @@ impl UiTree {
         self.interaction_runtime.press_button = pointer.button;
         self.interaction_runtime.press_timestamp = pointer.timestamp;
         self.interaction_runtime.press_cancelled = false;
-        if let Some(target) = target {
+        if let Some(target) = target.filter(|target| !self.pressable_is_disabled(*target)) {
+            if self.interaction_runtime.resizables.contains_key(&target) {
+                self.capture_pointer(target)?;
+                self.begin_resize(target, pointer.position)?;
+            }
             self.set_pressed(target, true);
             if self
                 .nodes
@@ -647,6 +1328,7 @@ impl UiTree {
         }
         let is_click = pressed.is_some_and(|pressed| {
             Some(pressed) == target
+                && !self.pressable_is_disabled(pressed)
                 && self.interaction_runtime.press_button == pointer.button
                 && !self.interaction_runtime.press_cancelled
                 && self
@@ -661,8 +1343,19 @@ impl UiTree {
             click.click_count = click_count;
             self.dispatch_to_target(pressed, Event::new(EventKind::Click(click)));
             if click_count == 2 {
-                self.dispatch_to_target(pressed, Event::new(EventKind::DoubleClick(click)));
+                let event =
+                    self.dispatch_to_target(pressed, Event::new(EventKind::DoubleClick(click)));
+                if !event.default_prevented()
+                    && self.interaction_runtime.resizables.contains_key(&pressed)
+                {
+                    self.reset_resizable(pressed)?;
+                }
             }
+        }
+        if let Some(target) = target
+            && self.interaction_runtime.resizables.contains_key(&target)
+        {
+            self.end_resize(target)?;
         }
         if let Some(pressed) = pressed {
             self.set_pressed(pressed, false);
@@ -832,58 +1525,6 @@ impl UiTree {
         Ok(self.dispatch_to_target(target, event))
     }
 
-    pub fn dispatch_behavior_command(
-        &mut self,
-        root: NodeId,
-        command: BehaviorCommand,
-        elapsed: Duration,
-    ) -> Result<Event, RuntimeError> {
-        self.nodes
-            .get(&root)
-            .ok_or(RuntimeError::UnknownNode(root))?;
-        let focused = self.interaction_runtime.focus.focused;
-        let target = focused
-            .filter(|node| *node == root || self.is_descendant(*node, root))
-            .unwrap_or(root);
-        let mut event =
-            self.dispatch_to_target(target, Event::new(EventKind::BehaviorCommand(command)));
-        if event.default_prevented() {
-            return Ok(event);
-        }
-        match command {
-            BehaviorCommand::Activate => {
-                let click = self.dispatch_to_target(
-                    target,
-                    Event::new(EventKind::Click(PointerEvent {
-                        button: Some(PointerButton::Primary),
-                        click_count: 1,
-                        timestamp: elapsed,
-                        ..PointerEvent::default()
-                    })),
-                );
-                if click.default_prevented() {
-                    event.prevent_default();
-                }
-            }
-            BehaviorCommand::MoveNext => {
-                self.traverse_focus_in(root, false, None)?;
-            }
-            BehaviorCommand::MovePrevious => {
-                self.traverse_focus_in(root, true, None)?;
-            }
-            BehaviorCommand::MoveFirst => {
-                self.traverse_focus_in(root, false, Some(false))?;
-            }
-            BehaviorCommand::MoveLast => {
-                self.traverse_focus_in(root, false, Some(true))?;
-            }
-            BehaviorCommand::Increment => self.adjust_focused_resizable(1.0)?,
-            BehaviorCommand::Decrement => self.adjust_focused_resizable(-1.0)?,
-            BehaviorCommand::Cancel => self.cancel_active_resize(target),
-        }
-        Ok(event)
-    }
-
     pub fn register_pressable(
         &mut self,
         node: NodeId,
@@ -893,9 +1534,14 @@ impl UiTree {
         self.nodes
             .get(&node)
             .ok_or(RuntimeError::UnknownNode(node))?;
-        self.interaction_runtime
-            .pressables
-            .insert(node, PressableState { disabled });
+        self.state.insert(node, Pressable::new(disabled));
+        self.interaction_runtime.pressables.insert(
+            node,
+            PressableState {
+                disabled,
+                ..PressableState::default()
+            },
+        );
         let current = self.nodes[&node].focus_policy;
         self.set_focus_policy(
             node,
@@ -918,6 +1564,45 @@ impl UiTree {
         }
         self.set_accessibility_semantics(node, semantics)
             .and_then(|()| self.invalidate(node, DirtyFlags::PAINT))
+    }
+
+    pub fn set_pressable_disabled(
+        &mut self,
+        node: NodeId,
+        disabled: bool,
+    ) -> Result<(), RuntimeError> {
+        if self.state.get::<Pressable>(node).is_none() {
+            return Err(RuntimeError::UnknownNode(node));
+        }
+        self.state.insert(node, Pressable::new(disabled));
+        if let Some(state) = self.interaction_runtime.pressables.get_mut(&node) {
+            state.disabled = disabled;
+        }
+        let policy = self.nodes[&node].focus_policy;
+        self.set_focus_policy(node, FocusPolicy { disabled, ..policy })?;
+        if let Some(semantics) = self
+            .nodes
+            .get_mut(&node)
+            .and_then(|node| node.accessibility.as_mut())
+        {
+            semantics.state.disabled = Some(disabled);
+        }
+        self.invalidate(node, DirtyFlags::PAINT)?;
+        self.invalidate_accessibility_node(node);
+        Ok(())
+    }
+
+    pub fn pressable_state(&self, node: NodeId) -> Option<PressableState> {
+        self.state.get::<Pressable>(node)?;
+        let interaction = self.nodes.get(&node)?.interaction;
+        Some(PressableState {
+            hovered: interaction.hovered,
+            active: interaction.pressed,
+            focused: interaction.focused,
+            focus_visible: interaction.focused
+                && self.interaction_runtime.input_modality == InputModality::Keyboard,
+            disabled: self.pressable_is_disabled(node),
+        })
     }
 
     pub fn register_resizable(
@@ -1035,6 +1720,7 @@ impl UiTree {
     }
 
     fn dispatch_key(&mut self, root: NodeId, mut event: Event) -> Result<Event, RuntimeError> {
+        self.interaction_runtime.input_modality = InputModality::Keyboard;
         let target = self.interaction_runtime.focus.focused.unwrap_or(root);
         self.dispatch_event_along_path(target, &mut event);
         if event.event_type() == EventType::KeyDown {
@@ -1165,26 +1851,24 @@ impl UiTree {
         self.set_accessibility_semantics(node, semantics)
     }
 
-    fn adjust_resizable(&mut self, node: NodeId, direction: f32) -> Result<(), RuntimeError> {
+    pub(crate) fn adjust_resizable(
+        &mut self,
+        node: NodeId,
+        direction: f32,
+    ) -> Result<bool, RuntimeError> {
         let Some(resizable) = self.interaction_runtime.resizables.get_mut(&node) else {
-            return Ok(());
+            return Ok(false);
         };
         let value = (resizable.value + direction * resizable.config.step)
             .clamp(resizable.config.min, resizable.config.max);
         if value == resizable.value {
-            return Ok(());
+            return Ok(false);
         }
         resizable.value = value;
         self.invalidate(node, DirtyFlags::LAYOUT)?;
         self.invalidate(node, DirtyFlags::PAINT)?;
-        self.update_resizable_semantics(node)
-    }
-
-    fn adjust_focused_resizable(&mut self, direction: f32) -> Result<(), RuntimeError> {
-        if let Some(focused) = self.interaction_runtime.focus.focused {
-            self.adjust_resizable(focused, direction)?;
-        }
-        Ok(())
+        self.update_resizable_semantics(node)?;
+        Ok(true)
     }
 
     fn cancel_active_resize(&mut self, node: NodeId) {
@@ -1294,7 +1978,12 @@ impl UiTree {
         let mut current = Some(target);
         while let Some(node) = current {
             path.push(node);
-            current = self.nodes.get(&node).and_then(|target| target.parent);
+            current = self
+                .interaction_runtime
+                .portals
+                .get(&node)
+                .map(|portal| portal.logical_owner)
+                .or_else(|| self.nodes.get(&node).and_then(|target| target.parent));
         }
         path.reverse();
         path
@@ -1330,8 +2019,13 @@ impl UiTree {
         target.focus_policy = policy;
         target.dirty.insert(DirtyFlags::ACCESSIBILITY);
         self.invalidate_accessibility_chain(node);
-        self.rebuild_focus_order();
-        if policy.disabled && self.focus_manager().focused() == Some(node) {
+        self.interaction_runtime.mark_focus_order_dirty();
+        if policy.disabled
+            && self
+                .focus_manager()
+                .focused()
+                .is_some_and(|focused| self.is_descendant(focused, node))
+        {
             self.clear_focus();
         }
         Ok(())
@@ -1342,7 +2036,7 @@ impl UiTree {
             .nodes
             .get(&node)
             .ok_or(RuntimeError::UnknownNode(node))?;
-        if !target.focus_policy.focusable || target.focus_policy.disabled {
+        if !target.focus_policy.focusable || !self.can_focus_through_ancestors(node) {
             return Ok(false);
         }
         if let Some(scope) = self.interaction_runtime.focus.scopes.last()
@@ -1350,6 +2044,15 @@ impl UiTree {
             && !self.is_descendant(node, scope.node)
         {
             return Ok(false);
+        }
+        if let Some(request) = self
+            .interaction_runtime
+            .layers
+            .focus_outside(Some(node), |scope, target| {
+                self.is_descendant(target, scope)
+            })
+        {
+            self.interaction_runtime.dismiss_requests.push_back(request);
         }
         self.set_focused(node);
         Ok(true)
@@ -1414,6 +2117,9 @@ impl UiTree {
             if !self.is_descendant(initial, node) {
                 return Err(RuntimeError::FocusTargetOutsideScope);
             }
+        }
+        if self.interaction_runtime.focus.order_dirty {
+            self.rebuild_focus_order();
         }
         let scope = FocusScope {
             node,
@@ -1511,11 +2217,11 @@ impl UiTree {
             .enumerate()
             .filter_map(|(order, node)| {
                 let policy = self.nodes.get(&node)?.focus_policy;
-                (policy.focusable && !policy.disabled && policy.tab_index >= 0).then_some((
-                    node,
-                    policy.tab_index,
-                    order,
-                ))
+                (policy.focusable
+                    && !policy.disabled
+                    && policy.tab_index >= 0
+                    && self.can_focus_through_ancestors(node))
+                .then_some((node, policy.tab_index, order))
             })
             .collect::<Vec<_>>();
         focusable.sort_by_key(|(_, tab_index, order)| {
@@ -1529,22 +2235,68 @@ impl UiTree {
 
     fn collect_document_order(&self, node: NodeId, order: &mut Vec<NodeId>) {
         order.push(node);
-        if let Some(target) = self.nodes.get(&node) {
-            for child in &target.children {
-                self.collect_document_order(*child, order);
-            }
+        for child in self.semantic_children(node) {
+            self.collect_document_order(child, order);
         }
     }
 
     fn is_descendant(&self, node: NodeId, ancestor: NodeId) -> bool {
-        let mut current = Some(node);
-        while let Some(candidate) = current {
+        let mut pending = vec![node];
+        let mut visited = std::collections::HashSet::new();
+        while let Some(candidate) = pending.pop() {
             if candidate == ancestor {
                 return true;
             }
-            current = self.nodes.get(&candidate).and_then(|target| target.parent);
+            if !visited.insert(candidate) {
+                continue;
+            }
+            if let Some(parent) = self.nodes.get(&candidate).and_then(|target| target.parent) {
+                pending.push(parent);
+            }
+            if let Some(owner) = self
+                .interaction_runtime
+                .portals
+                .get(&candidate)
+                .map(|portal| portal.logical_owner)
+            {
+                pending.push(owner);
+            }
         }
         false
+    }
+
+    fn can_focus_through_ancestors(&self, node: NodeId) -> bool {
+        let mut pending = vec![node];
+        let mut visited = std::collections::HashSet::new();
+        while let Some(candidate) = pending.pop() {
+            let Some(target) = self.nodes.get(&candidate) else {
+                return false;
+            };
+            if target.focus_policy.disabled {
+                return false;
+            }
+            if !visited.insert(candidate) {
+                continue;
+            }
+            if let Some(parent) = target.parent {
+                pending.push(parent);
+            }
+            if let Some(owner) = self
+                .interaction_runtime
+                .portals
+                .get(&candidate)
+                .map(|portal| portal.logical_owner)
+            {
+                pending.push(owner);
+            }
+        }
+        true
+    }
+
+    fn pressable_is_disabled(&self, node: NodeId) -> bool {
+        self.state
+            .get::<Pressable>(node)
+            .is_some_and(|pressable| pressable.disabled())
     }
 }
 
@@ -1558,7 +2310,7 @@ mod tests {
     use std::{cell::RefCell, rc::Rc};
 
     use super::*;
-    use crate::{Dimension, LayoutStyle, PaintState};
+    use crate::{Dimension, LayoutStyle, OutsidePointerPolicy, PaintState};
     use ui_core::Size;
 
     fn tree_with_root() -> (UiTree, NodeId) {
@@ -1938,5 +2690,458 @@ mod tests {
         )
         .unwrap();
         assert_eq!(*shortcut_hits.borrow(), 1);
+    }
+
+    #[test]
+    fn pressable_pointer_keyboard_and_accessibility_share_click_dispatch() {
+        use crate::{AccessibilityAction, AccessibilityActionRequest, SemanticTree};
+
+        let (mut tree, root) = tree_with_root();
+        let button = tree
+            .create_node(Some(root), LayoutStyle::default(), PaintState::default())
+            .unwrap();
+        tree.set_hit_test_state(root, hit_state(Transform::IDENTITY, 0))
+            .unwrap();
+        tree.set_hit_test_state(button, hit_state(Transform::IDENTITY, 0))
+            .unwrap();
+        tree.register_pressable(button, Some("Run".to_owned()), false)
+            .unwrap();
+        let activations = Rc::new(RefCell::new(0));
+        let observed = activations.clone();
+        tree.add_event_listener(button, EventType::Click, ListenerPhase::Bubble, move |_| {
+            *observed.borrow_mut() += 1;
+        })
+        .unwrap();
+
+        let pointer = PointerEvent {
+            position: Point::new(10.0, 10.0),
+            button: Some(PointerButton::Primary),
+            timestamp: Duration::from_millis(10),
+            ..PointerEvent::default()
+        };
+        tree.pointer_down(root, pointer).unwrap();
+        assert!(tree.pressable_state(button).unwrap().active);
+        tree.pointer_up(
+            root,
+            PointerEvent {
+                timestamp: Duration::from_millis(20),
+                ..pointer
+            },
+        )
+        .unwrap();
+        assert_eq!(*activations.borrow(), 1);
+
+        tree.request_focus(button).unwrap();
+        tree.dispatch_behavior_command(root, BehaviorCommand::Activate, Duration::from_millis(30))
+            .unwrap();
+        assert_eq!(*activations.borrow(), 2);
+        assert!(tree.pressable_state(button).unwrap().focus_visible);
+
+        let mut semantics = SemanticTree::default();
+        let _ = semantics.update(&mut tree, root).unwrap();
+        let id = semantics.accessibility_id(button).unwrap();
+        semantics
+            .route_action(
+                &mut tree,
+                AccessibilityActionRequest {
+                    target: id,
+                    action: AccessibilityAction::Press,
+                },
+            )
+            .unwrap();
+        assert_eq!(*activations.borrow(), 3);
+
+        tree.set_pressable_disabled(button, true).unwrap();
+        tree.pointer_down(root, pointer).unwrap();
+        tree.pointer_up(root, pointer).unwrap();
+        tree.dispatch_behavior_command(root, BehaviorCommand::Activate, Duration::ZERO)
+            .unwrap();
+        assert_eq!(*activations.borrow(), 3);
+        let update = semantics.update(&mut tree, root).unwrap();
+        assert_eq!(update.changed.len(), 1);
+        assert_eq!(update.changed[0].state.disabled, Some(true));
+        assert!(
+            !update.changed[0]
+                .actions
+                .contains(&AccessibilityActionKind::Press)
+        );
+    }
+
+    #[test]
+    fn nested_pressable_stop_propagation_activates_only_inner_listener() {
+        let (mut tree, root) = tree_with_root();
+        let outer = tree
+            .create_node(Some(root), LayoutStyle::default(), PaintState::default())
+            .unwrap();
+        let inner = tree
+            .create_node(Some(outer), LayoutStyle::default(), PaintState::default())
+            .unwrap();
+        tree.register_pressable(outer, None, false).unwrap();
+        tree.register_pressable(inner, None, false).unwrap();
+        let outer_hits = Rc::new(RefCell::new(0));
+        let inner_hits = Rc::new(RefCell::new(0));
+        let outer_seen = outer_hits.clone();
+        let inner_seen = inner_hits.clone();
+        tree.add_event_listener(outer, EventType::Click, ListenerPhase::Bubble, move |_| {
+            *outer_seen.borrow_mut() += 1;
+        })
+        .unwrap();
+        tree.add_event_listener(
+            inner,
+            EventType::Click,
+            ListenerPhase::Bubble,
+            move |event| {
+                *inner_seen.borrow_mut() += 1;
+                event.stop_propagation();
+            },
+        )
+        .unwrap();
+        tree.request_focus(inner).unwrap();
+        tree.dispatch_behavior_command(root, BehaviorCommand::Activate, Duration::ZERO)
+            .unwrap();
+        assert_eq!(*inner_hits.borrow(), 1);
+        assert_eq!(*outer_hits.borrow(), 0);
+    }
+
+    #[test]
+    fn nested_focus_scopes_restore_focus_and_reject_disabled_subtrees() {
+        let (mut tree, root) = tree_with_root();
+        let outside = tree
+            .create_node(Some(root), LayoutStyle::default(), PaintState::default())
+            .unwrap();
+        let outer = tree
+            .create_node(Some(root), LayoutStyle::default(), PaintState::default())
+            .unwrap();
+        let outer_focus = tree
+            .create_node(Some(outer), LayoutStyle::default(), PaintState::default())
+            .unwrap();
+        let inner = tree
+            .create_node(Some(outer), LayoutStyle::default(), PaintState::default())
+            .unwrap();
+        let inner_focus = tree
+            .create_node(Some(inner), LayoutStyle::default(), PaintState::default())
+            .unwrap();
+        for node in [outside, outer_focus, inner_focus] {
+            tree.set_focus_policy(
+                node,
+                FocusPolicy {
+                    focusable: true,
+                    ..FocusPolicy::default()
+                },
+            )
+            .unwrap();
+        }
+        tree.request_focus(outside).unwrap();
+        tree.push_focus_scope(outer, true, true, Some(outer_focus))
+            .unwrap();
+        tree.push_focus_scope(inner, true, true, Some(inner_focus))
+            .unwrap();
+        assert!(!tree.request_focus(outside).unwrap());
+        assert_eq!(tree.focus_manager().focused(), Some(inner_focus));
+        tree.pop_focus_scope(inner).unwrap();
+        assert_eq!(tree.focus_manager().focused(), Some(outer_focus));
+        tree.pop_focus_scope(outer).unwrap();
+        assert_eq!(tree.focus_manager().focused(), Some(outside));
+
+        tree.set_focus_policy(
+            outer,
+            FocusPolicy {
+                disabled: true,
+                ..FocusPolicy::default()
+            },
+        )
+        .unwrap();
+        assert!(!tree.request_focus(outer_focus).unwrap());
+    }
+
+    #[test]
+    fn overlay_blocks_outside_pointer_and_escape_dismisses_top_layer() {
+        let (mut tree, root) = tree_with_root();
+        let lower = tree
+            .create_node(Some(root), LayoutStyle::default(), PaintState::default())
+            .unwrap();
+        let upper = tree
+            .create_node(Some(root), LayoutStyle::default(), PaintState::default())
+            .unwrap();
+        tree.set_hit_test_state(root, hit_state(Transform::IDENTITY, 0))
+            .unwrap();
+        tree.set_hit_test_state(lower, hit_state(Transform::translation(10.0, 10.0), 1))
+            .unwrap();
+        tree.set_hit_test_state(upper, hit_state(Transform::translation(50.0, 50.0), 2))
+            .unwrap();
+        tree.open_layer(LayerSpec {
+            node: lower,
+            z_layer: 1,
+            outside_pointer: OutsidePointerPolicy::DismissAndContinue,
+            dismiss_on_escape: true,
+            ..LayerSpec::default()
+        })
+        .unwrap();
+        tree.open_layer(LayerSpec {
+            node: upper,
+            z_layer: 2,
+            modal: true,
+            blocks_pointer: true,
+            outside_pointer: OutsidePointerPolicy::DismissAndBlock,
+            dismiss_on_escape: true,
+            ..LayerSpec::default()
+        })
+        .unwrap();
+        let hits = Rc::new(RefCell::new(0));
+        let observed = hits.clone();
+        tree.add_event_listener(
+            root,
+            EventType::PointerDown,
+            ListenerPhase::Bubble,
+            move |_| {
+                *observed.borrow_mut() += 1;
+            },
+        )
+        .unwrap();
+        tree.pointer_down(
+            root,
+            PointerEvent {
+                position: Point::new(20.0, 20.0),
+                button: Some(PointerButton::Primary),
+                ..PointerEvent::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(*hits.borrow(), 0);
+        let outside = tree.take_layer_dismiss_requests();
+        assert_eq!(outside.len(), 1);
+        assert_eq!(outside[0].node, upper);
+        tree.dispatch_behavior_command(root, BehaviorCommand::Cancel, Duration::ZERO)
+            .unwrap();
+        let escape = tree.take_layer_dismiss_requests();
+        assert_eq!(escape.len(), 1);
+        assert_eq!(escape[0].node, upper);
+    }
+
+    #[test]
+    fn resize_uses_pointer_capture_clamps_bounds_and_double_click_resets() {
+        let (mut tree, root) = tree_with_root();
+        let handle = tree
+            .create_node(Some(root), LayoutStyle::default(), PaintState::default())
+            .unwrap();
+        tree.set_hit_test_state(
+            root,
+            HitTestState {
+                bounds: Rect::from_min_size(Point::ZERO, Size::new(100.0, 100.0)),
+                ..HitTestState::default()
+            },
+        )
+        .unwrap();
+        tree.set_hit_test_state(handle, hit_state(Transform::IDENTITY, 1))
+            .unwrap();
+        tree.register_resizable(
+            handle,
+            ResizeConfig {
+                axis: crate::ResizeAxis::Horizontal,
+                min: 20.0,
+                max: 40.0,
+                step: 5.0,
+                reset: 30.0,
+            },
+            30.0,
+            Some("Sidebar width".to_owned()),
+        )
+        .unwrap();
+        let pointer = PointerEvent {
+            position: Point::new(10.0, 10.0),
+            button: Some(PointerButton::Primary),
+            timestamp: Duration::from_millis(1),
+            ..PointerEvent::default()
+        };
+        tree.pointer_down(root, pointer).unwrap();
+        assert_eq!(tree.pointer_state().captured_target, Some(handle));
+        tree.pointer_move(
+            root,
+            PointerEvent {
+                position: Point::new(200.0, 10.0),
+                ..pointer
+            },
+        )
+        .unwrap();
+        assert_eq!(tree.resizable_value(handle), Some(40.0));
+        tree.pointer_up(
+            root,
+            PointerEvent {
+                position: Point::new(200.0, 10.0),
+                timestamp: Duration::from_millis(20),
+                ..pointer
+            },
+        )
+        .unwrap();
+        assert_eq!(tree.pointer_state().captured_target, None);
+
+        for time in [Duration::from_millis(100), Duration::from_millis(200)] {
+            tree.pointer_down(
+                root,
+                PointerEvent {
+                    timestamp: time,
+                    ..pointer
+                },
+            )
+            .unwrap();
+            tree.pointer_up(
+                root,
+                PointerEvent {
+                    timestamp: time + Duration::from_millis(5),
+                    ..pointer
+                },
+            )
+            .unwrap();
+        }
+        assert_eq!(tree.resizable_value(handle), Some(30.0));
+    }
+
+    #[test]
+    fn portal_reparents_for_paint_but_routes_events_and_semantics_to_owner() {
+        use crate::{AccessibilityRole, AccessibilitySemantics, SemanticTree};
+
+        let (mut tree, root) = tree_with_root();
+        let owner = tree
+            .create_node(Some(root), LayoutStyle::default(), PaintState::default())
+            .unwrap();
+        let overlay_host = tree
+            .create_node(Some(root), LayoutStyle::default(), PaintState::default())
+            .unwrap();
+        let portal = tree
+            .create_node(Some(owner), LayoutStyle::default(), PaintState::default())
+            .unwrap();
+        tree.set_accessibility_semantics(
+            owner,
+            AccessibilitySemantics::new(AccessibilityRole::Group),
+        )
+        .unwrap();
+        tree.set_accessibility_semantics(
+            overlay_host,
+            AccessibilitySemantics::new(AccessibilityRole::Group),
+        )
+        .unwrap();
+        tree.set_accessibility_semantics(
+            portal,
+            AccessibilitySemantics::new(AccessibilityRole::Tooltip),
+        )
+        .unwrap();
+        let layer = tree
+            .open_layer(LayerSpec {
+                node: overlay_host,
+                ..LayerSpec::default()
+            })
+            .unwrap();
+        tree.register_portal(portal, owner, layer).unwrap();
+        assert_eq!(tree.node(portal).unwrap().parent(), Some(overlay_host));
+
+        let calls = Rc::new(RefCell::new(0));
+        let observed = calls.clone();
+        tree.add_event_listener(
+            owner,
+            EventType::Click,
+            ListenerPhase::Bubble,
+            move |event| {
+                assert_eq!(event.target(), Some(portal));
+                *observed.borrow_mut() += 1;
+            },
+        )
+        .unwrap();
+        tree.dispatch_to_node(
+            portal,
+            Event::new(EventKind::Click(PointerEvent::default())),
+        )
+        .unwrap();
+        assert_eq!(*calls.borrow(), 1);
+
+        let mut semantics = SemanticTree::default();
+        semantics.update(&mut tree, root).unwrap();
+        let owner_id = semantics.accessibility_id(owner).unwrap();
+        let portal_id = semantics.accessibility_id(portal).unwrap();
+        assert!(semantics.nodes()[&owner_id].children.contains(&portal_id));
+        assert!(
+            !semantics.nodes()[&semantics.accessibility_id(overlay_host).unwrap()]
+                .children
+                .contains(&portal_id)
+        );
+    }
+
+    #[test]
+    fn tooltip_relation_and_resizable_accessibility_changes_are_semantic_diffs() {
+        use crate::{
+            AccessibilityAction, AccessibilityActionRequest, AccessibilityRole, SemanticTree,
+            TooltipDelays,
+        };
+
+        let (mut tree, root) = tree_with_root();
+        let trigger = tree
+            .create_node(Some(root), LayoutStyle::default(), PaintState::default())
+            .unwrap();
+        let tooltip = tree
+            .create_node(Some(root), LayoutStyle::default(), PaintState::default())
+            .unwrap();
+        let splitter = tree
+            .create_node(Some(root), LayoutStyle::default(), PaintState::default())
+            .unwrap();
+        tree.register_pressable(trigger, Some("Help".to_owned()), false)
+            .unwrap();
+        tree.register_tooltip(
+            trigger,
+            tooltip,
+            TooltipDelays {
+                open: Duration::ZERO,
+                close: Duration::from_millis(10),
+            },
+            "Help details",
+        )
+        .unwrap();
+        tree.register_resizable(
+            splitter,
+            ResizeConfig {
+                axis: crate::ResizeAxis::Horizontal,
+                min: 80.0,
+                max: 300.0,
+                step: 10.0,
+                reset: 120.0,
+            },
+            120.0,
+            Some("Panel size".to_owned()),
+        )
+        .unwrap();
+        let mut semantics = SemanticTree::default();
+        let initial = semantics.update(&mut tree, root).unwrap();
+        let trigger_id = semantics.accessibility_id(trigger).unwrap();
+        assert!(semantics.nodes()[&trigger_id].described_by.is_empty());
+        assert!(semantics.accessibility_id(tooltip).is_none());
+
+        tree.update_tooltip(
+            trigger,
+            Duration::ZERO,
+            TooltipTriggers {
+                trigger_focused: true,
+                ..TooltipTriggers::default()
+            },
+        )
+        .unwrap();
+        let tooltip_update = semantics.update(&mut tree, root).unwrap();
+        assert_eq!(tooltip_update.added.len(), 1);
+        assert_eq!(tooltip_update.added[0].role, AccessibilityRole::Tooltip);
+        let tooltip_id = semantics.accessibility_id(tooltip).unwrap();
+        assert_eq!(semantics.nodes()[&trigger_id].described_by, [tooltip_id]);
+
+        let splitter_id = semantics.accessibility_id(splitter).unwrap();
+        semantics
+            .route_action(
+                &mut tree,
+                AccessibilityActionRequest {
+                    target: splitter_id,
+                    action: AccessibilityAction::Increment,
+                },
+            )
+            .unwrap();
+        assert_eq!(tree.resizable_value(splitter), Some(130.0));
+        let resize_update = semantics.update(&mut tree, root).unwrap();
+        assert_eq!(resize_update.changed.len(), 1);
+        assert_eq!(resize_update.changed[0].value.as_deref(), Some("130"));
+        assert!(initial.added.len() >= 2);
     }
 }
